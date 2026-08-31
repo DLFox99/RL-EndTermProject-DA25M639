@@ -194,26 +194,49 @@ def train_sb3(algo_class, tech_name, config, tc, model_dir, student_config, forc
     vec_env = DummyVecEnv([env_fn for _ in range(n_envs)])
 
     # --- resume or create ---
+    # Resume priority: checkpoints/checkpoint.zip (most recent, mid-training)
+    #                   > final_model.zip (a previously completed/migrated run)
+    #                   > fresh model
     ckpt_path = model_dir / "checkpoints" / "checkpoint.zip"
+    final_path = model_dir / "final_model.zip"
     steps_done = 0
     episodes_done = 0
     best_cost = float("inf")
 
+    resume_from = None
     if not force and ckpt_path.exists():
-        print(f"{tech_name}: resuming from checkpoint")
-        model = algo_class.load(str(model_dir / "checkpoints" / "checkpoint"),
-                                env=vec_env)
+        resume_from = model_dir / "checkpoints" / "checkpoint"
+        resume_kind = "checkpoint"
+    elif not force and final_path.exists():
+        resume_from = model_dir / "final_model"
+        resume_kind = "final_model"
+
+    if resume_from is not None:
+        print(f"{tech_name}: resuming from {resume_kind} "
+              f"({resume_from.name}.zip)")
+        model = algo_class.load(str(resume_from), env=vec_env)
         if meta:
             steps_done = meta.get("steps_completed", 0)
             episodes_done = meta.get("episodes_completed", 0)
             best_cost = meta.get("best_rolling_cost") or float("inf")
+        else:
+            print(f"  WARNING: no training_metadata.json found for "
+                  f"{tech_name}. Assuming 0 steps completed — if this "
+                  f"model was actually trained, timestep counts in "
+                  f"train_log.csv will be wrong. Run migrate_existing.py "
+                  f"or create training_metadata.json manually.")
 
-        # Load replay buffer for off-policy
-        if is_offpolicy:
+        # Load replay buffer for off-policy (only meaningful if resuming
+        # from a checkpoint — a bare final_model won't have one)
+        if is_offpolicy and resume_kind == "checkpoint":
             buf_path = model_dir / "checkpoints" / "replay_buffer.pkl"
             if buf_path.exists():
                 model.load_replay_buffer(str(model_dir / "checkpoints" / "replay_buffer"))
                 print(f"  Replay buffer loaded")
+        elif is_offpolicy and resume_kind == "final_model":
+            print(f"  Note: resuming off-policy algo from final_model with "
+                  f"no replay buffer — buffer will rebuild from scratch "
+                  f"during learning_starts warmup.")
     else:
         if force and model_dir.exists():
             for f in model_dir.iterdir():
@@ -317,7 +340,11 @@ def train_reinforce(config, tc, model_dir, student_config, force):
         return
 
     # --- resume or create ---
+    # Resume priority: checkpoints/checkpoint.pt (has optimizer + baseline state)
+    #                   > final_model.pt (weights only — a previous/migrated run)
+    #                   > fresh model
     ckpt_path = model_dir / "checkpoints" / "checkpoint.pt"
+    final_path = model_dir / "final_model.pt"
     ep_start = 0
     baseline = 0.0
     best_cost = float("inf")
@@ -326,13 +353,27 @@ def train_reinforce(config, tc, model_dir, student_config, force):
     optimizer = torch.optim.Adam(policy.parameters(), lr=lr)
 
     if not force and ckpt_path.exists():
-        print("REINFORCE: resuming from checkpoint")
+        print("REINFORCE: resuming from checkpoint (full state)")
         ckpt_data = torch.load(str(ckpt_path), map_location="cpu", weights_only=False)
         policy.load_state_dict(ckpt_data["model_state"])
         optimizer.load_state_dict(ckpt_data["optimizer_state"])
         ep_start = ckpt_data.get("episode", 0)
         baseline = ckpt_data.get("baseline", 0.0)
         best_cost = ckpt_data.get("best_cost", float("inf"))
+    elif not force and final_path.exists():
+        print("REINFORCE: resuming from final_model.pt (weights only — "
+              "optimizer momentum and baseline reset)")
+        policy.load_state_dict(
+            torch.load(str(final_path), map_location="cpu", weights_only=True))
+        meta = _load_metadata(model_dir)
+        if meta:
+            ep_start = meta.get("episodes_completed", 0)
+            best_cost = meta.get("best_rolling_cost") or float("inf")
+        else:
+            print("  WARNING: no training_metadata.json found. Assuming "
+                  "0 episodes completed — episode/timestep counts in "
+                  "train_log.csv will be wrong. Run migrate_existing.py "
+                  "or create training_metadata.json manually.")
     elif force:
         for f in model_dir.iterdir():
             if f.is_file():
@@ -491,6 +532,7 @@ def train_tabular(config, tc, model_dir, student_config, force):
     agent = TabularAgent(discretizer.n_states)
 
     ckpt_path = model_dir / "checkpoints" / "checkpoint.npz"
+    final_path = model_dir / "final_model.npz"
     ep_start = 0
     best_cost = float("inf")
 
@@ -500,6 +542,15 @@ def train_tabular(config, tc, model_dir, student_config, force):
         if meta:
             ep_start = meta.get("episodes_completed", 0)
             best_cost = meta.get("best_rolling_cost") or float("inf")
+    elif not force and final_path.exists():
+        print(f"{name}: resuming from final_model.npz")
+        agent.load(str(final_path))
+        if meta:
+            ep_start = meta.get("episodes_completed", 0)
+            best_cost = meta.get("best_rolling_cost") or float("inf")
+        else:
+            print("  WARNING: no training_metadata.json found. Assuming "
+                  "0 episodes completed.")
     elif force:
         for f in model_dir.iterdir():
             if f.is_file(): f.unlink()
@@ -617,6 +668,7 @@ def train_nn_custom(config, tc, model_dir, student_config, force):
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
 
     ckpt_path = model_dir / "checkpoints" / "checkpoint.pt"
+    final_path = model_dir / "final_model.pt"
     ep_start = 0
     best_cost = float("inf")
 
@@ -627,6 +679,16 @@ def train_nn_custom(config, tc, model_dir, student_config, force):
         optimizer.load_state_dict(ckpt_data["optimizer_state"])
         ep_start = ckpt_data.get("episode", 0)
         best_cost = ckpt_data.get("best_cost", float("inf"))
+    elif not force and final_path.exists():
+        print(f"{name}: resuming from final_model.pt (optimizer state reset)")
+        model.load_state_dict(
+            torch.load(str(final_path), map_location="cpu", weights_only=True))
+        if meta:
+            ep_start = meta.get("episodes_completed", 0)
+            best_cost = meta.get("best_rolling_cost") or float("inf")
+        else:
+            print("  WARNING: no training_metadata.json found. Assuming "
+                  "0 episodes completed.")
     elif force:
         for f in model_dir.iterdir():
             if f.is_file(): f.unlink()
