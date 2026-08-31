@@ -1,4 +1,4 @@
-.PHONY: setup train-all train-parallel eval-all assemble validate ready \
+.PHONY: setup doctor train-all train-parallel eval-all assemble validate ready \
        clean dvc-push dvc-pull plot-all help
 
 PYTHON ?= python3
@@ -13,6 +13,7 @@ help:
 	@echo ""
 	@echo "  Setup:"
 	@echo "    make setup              Install dependencies, create directories"
+	@echo "    make doctor             Check environment for issues (run on new machines)"
 	@echo "    make migrate            Move existing flat models into pipeline structure"
 	@echo ""
 	@echo "  Training:"
@@ -53,10 +54,14 @@ setup:
 	pip install -r requirements-dev.txt
 	@mkdir -p models plots results submissions
 	@for t in $(TECHNIQUES); do mkdir -p models/$$t/checkpoints submissions/$$t; done
-	@echo "Setup complete."
+	@echo "Setup complete. Running environment check..."
+	@$(MAKE) doctor
 
 migrate:
 	$(PYTHON) migrate_existing.py --steps 5000000
+
+doctor:
+	$(PYTHON) check_env.py
 
 # ---- Training (pattern rule) ----
 
