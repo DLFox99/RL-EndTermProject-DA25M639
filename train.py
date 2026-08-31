@@ -48,17 +48,21 @@ from stable_baselines3.common.callbacks import BaseCallback
 
 
 class PipelineCallback(BaseCallback):
-    """Checkpoint every N minutes, log every episode, track best model."""
+    """Checkpoint every N minutes, log every episode, track best model.
+    Optionally auto-stop when convergence is detected."""
 
     def __init__(self, model_dir, checkpoint_min=5, steps_offset=0,
-                 episodes_offset=0, best_cost=float("inf"), verbose=0):
+                 episodes_offset=0, best_cost=float("inf"),
+                 auto_stop=True, verbose=0):
         super().__init__(verbose)
         self.model_dir = Path(model_dir)
         self.checkpoint_sec = checkpoint_min * 60
         self.steps_offset = steps_offset
         self.episode_count = episodes_offset
         self.best_cost = best_cost
+        self.auto_stop = auto_stop
         self.recent_costs = []
+        self._converged = False
 
         self.log_path = self.model_dir / "train_log.csv"
         self.start_wall = time.time()
@@ -72,6 +76,10 @@ class PipelineCallback(BaseCallback):
     @property
     def total_steps(self):
         return self.steps_offset + self.num_timesteps
+
+    @property
+    def converged(self):
+        return self._converged
 
     def _on_step(self) -> bool:
         # --- episode logging ---
@@ -98,9 +106,23 @@ class PipelineCallback(BaseCallback):
         now = time.time()
         if now - self.last_ckpt_wall >= self.checkpoint_sec:
             self._save_checkpoint()
+            self._check_auto_stop()
             self.last_ckpt_wall = now
 
+        # Returning False stops SB3 training
+        if self._converged:
+            return False
         return True
+
+    def _check_auto_stop(self):
+        if not self.auto_stop:
+            return
+        from check_convergence import check_convergence
+        result = check_convergence(self.log_path)
+        if result["converged"]:
+            print(f"\n  *** AUTO-STOP: {result['reason']}")
+            print(f"  *** Saving final model and stopping training early.")
+            self._converged = True
 
     def _save_checkpoint(self):
         ckpt = str(self.model_dir / "checkpoints" / "checkpoint")
@@ -304,6 +326,7 @@ def train_sb3(algo_class, tech_name, config, tc, model_dir, student_config, forc
         steps_offset=steps_done,
         episodes_offset=episodes_done,
         best_cost=best_cost,
+        auto_stop=tc.get("auto_stop", True),
     )
 
     model.learn(total_timesteps=remaining, callback=cb)
@@ -311,7 +334,10 @@ def train_sb3(algo_class, tech_name, config, tc, model_dir, student_config, forc
     # --- save final model ---
     model.save(str(model_dir / "final_model"))
     cb._write_metadata()
-    print(f"{tech_name}: done. Saved final_model.")
+    if cb.converged:
+        print(f"{tech_name}: stopped early (converged). Saved final_model.")
+    else:
+        print(f"{tech_name}: done. Saved final_model.")
 
 
 # ---------------------------------------------------------------------------
@@ -488,6 +514,14 @@ def train_reinforce(config, tc, model_dir, student_config, force):
                   f"best={best_cost:,.0f}")
             last_ckpt_wall = now
 
+            # Auto-stop check
+            if tc.get("auto_stop", True):
+                from check_convergence import check_convergence as _cc
+                cr = _cc(log_path)
+                if cr["converged"]:
+                    print(f"\n  *** AUTO-STOP: {cr['reason']}")
+                    break
+
         # Print progress
         if ep % 500 == 0:
             avg = np.mean(recent_costs[-500:]) if len(recent_costs) >= 500 \
@@ -626,6 +660,14 @@ def train_tabular(config, tc, model_dir, student_config, force):
             print(f"  [checkpoint] ep={abs_ep:,}  avg={avg:,.0f}  best={best_cost:,.0f}")
             last_ckpt_wall = now
 
+            # Auto-stop check
+            if tc.get("auto_stop", True):
+                from check_convergence import check_convergence as _cc
+                cr = _cc(log_path)
+                if cr["converged"]:
+                    print(f"\n  *** AUTO-STOP: {cr['reason']}")
+                    break
+
         if abs_ep % 2000 == 0:
             avg = np.mean(recent_costs[-2000:]) if len(recent_costs) >= 2000 \
                 else np.mean(recent_costs)
@@ -752,6 +794,14 @@ def train_nn_custom(config, tc, model_dir, student_config, force):
             avg = np.mean(recent_costs[-100:]) if recent_costs else 0
             print(f"  [checkpoint] ep={ep:,}  avg={avg:,.0f}  best={best_cost:,.0f}")
             last_ckpt_wall = now
+
+            # Auto-stop check
+            if tc.get("auto_stop", True):
+                from check_convergence import check_convergence as _cc
+                cr = _cc(log_path)
+                if cr["converged"]:
+                    print(f"\n  *** AUTO-STOP: {cr['reason']}")
+                    break
 
         if ep % 500 == 0:
             avg = np.mean(recent_costs[-500:]) if len(recent_costs) >= 500 \

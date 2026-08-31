@@ -37,6 +37,8 @@ help:
 	@echo "    make plot-ppo           Live training plot"
 	@echo "    make plot-all           Live plot all techniques"
 	@echo "    make plot-save          Save training plots as PNG"
+	@echo "    make check-ppo          Check if technique has converged"
+	@echo "    make check-all          Check convergence for all techniques"
 	@echo ""
 	@echo "  Sync:"
 	@echo "    make dvc-push           Push models to Google Drive"
@@ -115,6 +117,14 @@ plot-all:
 
 plot-save:
 	$(PYTHON) plot_live.py all --save
+
+# ---- Convergence check ----
+
+check-%:
+	$(PYTHON) check_convergence.py $*
+
+check-all:
+	$(PYTHON) check_convergence.py all
 
 # ---- Leaderboard logging ----
 
