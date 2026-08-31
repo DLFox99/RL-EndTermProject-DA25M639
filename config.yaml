@@ -1,0 +1,94 @@
+roll_number: "DA25M639"
+seed: 42
+checkpoint_interval_min: 5
+
+evaluation:
+  seeds: [100, 101, 102, 103, 104, 105, 106, 107, 108, 109,
+          110, 111, 112, 113, 114, 115, 116, 117, 118, 119]
+  scenario_modes: ["stationary", "seasonal", "trend", "shock", "random"]
+
+techniques:
+  ppo:
+    algo: PPO
+    category: onpolicy          # onpolicy | offpolicy | reinforce
+    action_type: multi          # multi | discrete
+    portal_name: "Proximal Policy Optimization (PPO)"
+    total_timesteps: 5000000
+    n_envs: 4
+    learning_rate: 3.0e-4
+    n_steps: 1024
+    batch_size: 256
+    n_epochs: 10
+    gamma: 0.99
+    gae_lambda: 0.95
+    clip_range: 0.2
+    ent_coef: 0.01
+    net_arch: [256, 128]
+
+  a2c:
+    algo: A2C
+    category: onpolicy
+    action_type: multi
+    portal_name: "A2C"
+    total_timesteps: 5000000
+    n_envs: 4
+    learning_rate: 7.0e-4
+    n_steps: 50
+    gamma: 0.99
+    gae_lambda: 0.95
+    ent_coef: 0.01
+    net_arch: [256, 128]
+
+  dqn:
+    algo: DQN
+    category: offpolicy
+    action_type: discrete
+    portal_name: "DQN"
+    total_timesteps: 5000000
+    n_envs: 1
+    learning_rate: 1.0e-4
+    buffer_size: 100000
+    learning_starts: 5000
+    batch_size: 128
+    gamma: 0.99
+    tau: 0.005
+    exploration_fraction: 0.3
+    exploration_initial_eps: 1.0
+    exploration_final_eps: 0.05
+    train_freq: 4
+    gradient_steps: 1
+    target_update_interval: 1000
+    net_arch: [256, 128]
+
+  ddqn:
+    algo: DoubleDQN
+    category: offpolicy
+    action_type: discrete
+    portal_name: "Double DQN"
+    total_timesteps: 5000000
+    n_envs: 1
+    learning_rate: 1.0e-4
+    buffer_size: 100000
+    learning_starts: 5000
+    batch_size: 128
+    gamma: 0.99
+    tau: 0.005
+    exploration_fraction: 0.3
+    exploration_initial_eps: 1.0
+    exploration_final_eps: 0.05
+    train_freq: 4
+    gradient_steps: 1
+    target_update_interval: 1000
+    net_arch: [256, 128]
+
+  reinforce:
+    algo: REINFORCE
+    category: reinforce
+    action_type: multi
+    portal_name: "REINFORCE with or without a baseline"
+    num_episodes: 20000
+    learning_rate: 1.0e-3
+    gamma: 0.99
+    hidden: 128
+    max_grad_norm: 1.0
+    baseline_alpha: 0.01
