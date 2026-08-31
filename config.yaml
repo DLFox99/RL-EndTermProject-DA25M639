@@ -93,8 +93,8 @@ techniques:
     category: reinforce
     action_type: multi
     portal_name: "REINFORCE with or without a baseline"
-    num_episodes: 20000
-    learning_rate: 1.0e-3
+    num_episodes: 200000
+    learning_rate: 3.0e-4
     gamma: 0.99
     hidden: 128
     max_grad_norm: 1.0

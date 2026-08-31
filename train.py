@@ -6,6 +6,7 @@ Usage:
     python train.py all              # train all sequentially
     python train.py ppo --force      # retrain from scratch
     python train.py ppo --timesteps 2000000  # override total timesteps
+    python train.py reinforce --episodes 200000  # override episode budget
 """
 
 import argparse
@@ -50,21 +51,29 @@ from stable_baselines3.common.callbacks import BaseCallback
 
 
 class PipelineCallback(BaseCallback):
-    """Checkpoint every N minutes, log every episode, track best model.
-    Optionally auto-stop when convergence is detected."""
+    """Checkpoint, log episodes, track best model, and report convergence.
+
+    Convergence is diagnostic only: it never stops training.  The configured
+    timestep budget remains authoritative.
+    """
 
     def __init__(self, model_dir, checkpoint_min=5, steps_offset=0,
                  episodes_offset=0, best_cost=float("inf"),
-                 auto_stop=True, verbose=0):
+                 technique_name="SB3", convergence_state=None, verbose=0):
         super().__init__(verbose)
         self.model_dir = Path(model_dir)
         self.checkpoint_sec = checkpoint_min * 60
         self.steps_offset = steps_offset
         self.episode_count = episodes_offset
         self.best_cost = best_cost
-        self.auto_stop = auto_stop
+        self.technique_name = technique_name
         self.recent_costs = []
-        self._converged = False
+        self.convergence_state = convergence_state or {
+            "detected": False,
+            "first_step": None,
+            "first_episode": None,
+            "reason": None,
+        }
 
         self.log_path = self.model_dir / "train_log.csv"
         self.start_wall = time.time()
@@ -81,7 +90,8 @@ class PipelineCallback(BaseCallback):
 
     @property
     def converged(self):
-        return self._converged
+        """Whether convergence has ever been detected during this run."""
+        return bool(self.convergence_state["detected"])
 
     def _on_step(self) -> bool:
         # --- episode logging ---
@@ -114,24 +124,22 @@ class PipelineCallback(BaseCallback):
         # --- time-based checkpoint ---
         now = time.time()
         if now - self.last_ckpt_wall >= self.checkpoint_sec:
+            self._check_convergence()
             self._save_checkpoint()
-            self._check_auto_stop()
             self.last_ckpt_wall = now
 
-        # Returning False stops SB3 training
-        if self._converged:
-            return False
+        # Convergence is advisory only.  Returning True keeps SB3 training
+        # until the requested timestep budget is exhausted.
         return True
 
-    def _check_auto_stop(self):
-        if not self.auto_stop:
-            return
-        from check_convergence import check_convergence
-        result = check_convergence(self.log_path)
-        if result["converged"]:
-            print(f"\n  *** AUTO-STOP: {result['reason']}")
-            print(f"  *** Saving final model and stopping training early.")
-            self._converged = True
+    def _check_convergence(self):
+        _check_convergence_warning(
+            log_path=self.log_path,
+            label=self.technique_name,
+            step=self.total_steps,
+            episode=self.episode_count,
+            state=self.convergence_state,
+        )
 
     def _save_checkpoint(self):
         ckpt = str(self.model_dir / "checkpoints" / "checkpoint")
@@ -146,7 +154,7 @@ class PipelineCallback(BaseCallback):
         self._print_status()
         wandb_utils.log_checkpoint(
             self.total_steps, self.episode_count,
-            self.best_cost, self._converged)
+            self.best_cost, self.converged)
 
     def _write_metadata(self):
         meta = {
@@ -155,6 +163,10 @@ class PipelineCallback(BaseCallback):
             "wall_time_s": time.time() - self.start_wall,
             "best_rolling_cost": self.best_cost
                 if self.best_cost < float("inf") else None,
+            "convergence_detected": self.convergence_state["detected"],
+            "convergence_first_step": self.convergence_state["first_step"],
+            "convergence_first_episode": self.convergence_state["first_episode"],
+            "convergence_reason": self.convergence_state["reason"],
             "last_checkpoint": datetime.now().isoformat(),
         }
         with open(self.model_dir / "training_metadata.json", "w") as f:
@@ -163,12 +175,14 @@ class PipelineCallback(BaseCallback):
     def _print_status(self):
         recent = self.recent_costs[-100:] if self.recent_costs else []
         avg = np.mean(recent) if recent else 0
+        convergence_note = "  convergence=detected" if self.converged else ""
         print(f"  [checkpoint] steps={self.total_steps:,}  "
               f"episodes={self.episode_count:,}  "
               f"recent_avg_cost={avg:,.0f}  "
-              f"best={self.best_cost:,.0f}")
+              f"best={self.best_cost:,.0f}{convergence_note}")
 
     def on_training_end(self):
+        self._check_convergence()
         self._save_checkpoint()
 
 
@@ -206,6 +220,48 @@ def _load_metadata(model_dir):
     return None
 
 
+def _convergence_state_from_meta(meta=None):
+    """Restore sticky, diagnostic convergence information from metadata."""
+    meta = meta or {}
+    return {
+        "detected": bool(meta.get("convergence_detected", False)),
+        "first_step": meta.get("convergence_first_step"),
+        "first_episode": meta.get("convergence_first_episode"),
+        "reason": meta.get("convergence_reason"),
+    }
+
+
+def _add_convergence_metadata(meta, state):
+    """Add convergence diagnostics to a training metadata dictionary."""
+    meta.update({
+        "convergence_detected": state["detected"],
+        "convergence_first_step": state["first_step"],
+        "convergence_first_episode": state["first_episode"],
+        "convergence_reason": state["reason"],
+    })
+    return meta
+
+
+def _check_convergence_warning(log_path, label, step, episode, state):
+    """Check convergence, warn once, and never alter the training budget."""
+    from check_convergence import check_convergence
+
+    result = check_convergence(log_path)
+    if result["converged"] and not state["detected"]:
+        state["detected"] = True
+        state["first_step"] = int(step)
+        state["first_episode"] = int(episode)
+        state["reason"] = result["reason"]
+
+        print()
+        print(f"  *** CONVERGENCE WARNING [{label}]")
+        print(f"  *** Detected at step {int(step):,}, episode {int(episode):,}")
+        print(f"  *** {result['reason']}")
+        print("  *** Training WILL CONTINUE to the configured target.")
+
+    return result
+
+
 def train_sb3(algo_class, tech_name, config, tc, model_dir, student_config, force):
     """Train any SB3 algorithm (on-policy or off-policy)."""
     from stable_baselines3.common.vec_env import DummyVecEnv
@@ -219,6 +275,8 @@ def train_sb3(algo_class, tech_name, config, tc, model_dir, student_config, forc
 
     # --- skip if done ---
     meta = _load_metadata(model_dir)
+    convergence_state = _convergence_state_from_meta(
+        meta if not force else None)
     if not force and meta and meta.get("steps_completed", 0) >= total:
         print(f"{tech_name}: already at {meta['steps_completed']:,} steps "
               f"(target {total:,}). Use --force to retrain.")
@@ -341,7 +399,8 @@ def train_sb3(algo_class, tech_name, config, tc, model_dir, student_config, forc
         steps_offset=steps_done,
         episodes_offset=episodes_done,
         best_cost=best_cost,
-        auto_stop=tc.get("auto_stop", True),
+        technique_name=tech_name,
+        convergence_state=convergence_state,
     )
 
     model.learn(total_timesteps=remaining, callback=cb)
@@ -350,7 +409,9 @@ def train_sb3(algo_class, tech_name, config, tc, model_dir, student_config, forc
     model.save(str(model_dir / "final_model"))
     cb._write_metadata()
     if cb.converged:
-        print(f"{tech_name}: stopped early (converged). Saved final_model.")
+        print(f"{tech_name}: done. Saved final_model. "
+              f"Convergence was detected during training; "
+              f"training still continued to the requested budget.")
     else:
         print(f"{tech_name}: done. Saved final_model.")
     wandb_utils.finish()
@@ -379,6 +440,8 @@ def train_reinforce(config, tc, model_dir, student_config, force):
 
     # --- skip if done ---
     meta = _load_metadata(model_dir)
+    convergence_state = _convergence_state_from_meta(
+        meta if not force else None)
     if not force and meta and meta.get("episodes_completed", 0) >= total_episodes:
         print(f"REINFORCE: already at {meta['episodes_completed']:,} episodes. "
               f"Use --force to retrain.")
@@ -530,6 +593,14 @@ def train_reinforce(config, tc, model_dir, student_config, force):
                 "best_rolling_cost": best_cost if best_cost < float("inf") else None,
                 "last_checkpoint": datetime.now().isoformat(),
             }
+            _check_convergence_warning(
+                log_path=log_path,
+                label="REINFORCE",
+                step=total_steps,
+                episode=ep,
+                state=convergence_state,
+            )
+            meta = _add_convergence_metadata(meta, convergence_state)
             with open(model_dir / "training_metadata.json", "w") as f:
                 json.dump(meta, f, indent=2)
 
@@ -537,14 +608,6 @@ def train_reinforce(config, tc, model_dir, student_config, force):
             print(f"  [checkpoint] ep={ep:,}  recent_avg_cost={avg:,.0f}  "
                   f"best={best_cost:,.0f}")
             last_ckpt_wall = now
-
-            # Auto-stop check
-            if tc.get("auto_stop", True):
-                from check_convergence import check_convergence as _cc
-                cr = _cc(log_path)
-                if cr["converged"]:
-                    print(f"\n  *** AUTO-STOP: {cr['reason']}")
-                    break
 
         # Print progress
         if ep % 500 == 0:
@@ -554,6 +617,13 @@ def train_reinforce(config, tc, model_dir, student_config, force):
 
     # Save final
     torch.save(policy.state_dict(), str(model_dir / "final_model.pt"))
+    _check_convergence_warning(
+        log_path=log_path,
+        label="REINFORCE",
+        step=total_steps,
+        episode=total_episodes,
+        state=convergence_state,
+    )
     meta = {
         "steps_completed": total_steps,
         "episodes_completed": total_episodes,
@@ -561,6 +631,7 @@ def train_reinforce(config, tc, model_dir, student_config, force):
         "best_rolling_cost": best_cost if best_cost < float("inf") else None,
         "completed_at": datetime.now().isoformat(),
     }
+    meta = _add_convergence_metadata(meta, convergence_state)
     with open(model_dir / "training_metadata.json", "w") as f:
         json.dump(meta, f, indent=2)
     print("REINFORCE: done. Saved final_model.pt")
@@ -586,6 +657,8 @@ def train_tabular(config, tc, model_dir, student_config, force):
     wandb_utils.init(tc.get("update_rule", "tabular"), config, tc)
 
     meta = _load_metadata(model_dir)
+    convergence_state = _convergence_state_from_meta(
+        meta if not force else None)
     if not force and meta and meta.get("episodes_completed", 0) >= total_episodes:
         print(f"{name}: already at {meta['episodes_completed']:,} episodes.")
         return
@@ -687,19 +760,19 @@ def train_tabular(config, tc, model_dir, student_config, force):
                     "wall_time_s": now - start_wall,
                     "best_rolling_cost": best_cost if best_cost < float("inf") else None,
                     "last_checkpoint": datetime.now().isoformat()}
+            _check_convergence_warning(
+                log_path=log_path,
+                label=name,
+                step=abs_ep * 50,
+                episode=abs_ep,
+                state=convergence_state,
+            )
+            meta = _add_convergence_metadata(meta, convergence_state)
             with open(model_dir / "training_metadata.json", "w") as f:
                 json.dump(meta, f, indent=2)
             avg = np.mean(recent_costs[-100:]) if recent_costs else 0
             print(f"  [checkpoint] ep={abs_ep:,}  avg={avg:,.0f}  best={best_cost:,.0f}")
             last_ckpt_wall = now
-
-            # Auto-stop check
-            if tc.get("auto_stop", True):
-                from check_convergence import check_convergence as _cc
-                cr = _cc(log_path)
-                if cr["converged"]:
-                    print(f"\n  *** AUTO-STOP: {cr['reason']}")
-                    break
 
         if abs_ep % 2000 == 0:
             avg = np.mean(recent_costs[-2000:]) if len(recent_costs) >= 2000 \
@@ -707,10 +780,18 @@ def train_tabular(config, tc, model_dir, student_config, force):
             print(f"  Episode {abs_ep:6,} | Avg Cost: {avg:,.0f}")
 
     agent.save(str(model_dir / "final_model.npz"))
+    _check_convergence_warning(
+        log_path=log_path,
+        label=name,
+        step=total_episodes * 50,
+        episode=total_episodes,
+        state=convergence_state,
+    )
     meta = {"steps_completed": total_episodes * 50, "episodes_completed": total_episodes,
             "wall_time_s": time.time() - start_wall,
             "best_rolling_cost": best_cost if best_cost < float("inf") else None,
             "completed_at": datetime.now().isoformat()}
+    meta = _add_convergence_metadata(meta, convergence_state)
     with open(model_dir / "training_metadata.json", "w") as f:
         json.dump(meta, f, indent=2)
     print(f"{name}: done. Saved final_model.npz")
@@ -739,6 +820,8 @@ def train_nn_custom(config, tc, model_dir, student_config, force):
     wandb_utils.init(tc.get("update_rule", "nn_custom"), config, tc)
 
     meta = _load_metadata(model_dir)
+    convergence_state = _convergence_state_from_meta(
+        meta if not force else None)
     if not force and meta and meta.get("episodes_completed", 0) >= total_episodes:
         print(f"{name}: already at {meta['episodes_completed']:,} episodes.")
         return
@@ -831,19 +914,19 @@ def train_nn_custom(config, tc, model_dir, student_config, force):
                     "wall_time_s": now - start_wall,
                     "best_rolling_cost": best_cost if best_cost < float("inf") else None,
                     "last_checkpoint": datetime.now().isoformat()}
+            _check_convergence_warning(
+                log_path=log_path,
+                label=name,
+                step=ep * 50,
+                episode=ep,
+                state=convergence_state,
+            )
+            meta = _add_convergence_metadata(meta, convergence_state)
             with open(model_dir / "training_metadata.json", "w") as f:
                 json.dump(meta, f, indent=2)
             avg = np.mean(recent_costs[-100:]) if recent_costs else 0
             print(f"  [checkpoint] ep={ep:,}  avg={avg:,.0f}  best={best_cost:,.0f}")
             last_ckpt_wall = now
-
-            # Auto-stop check
-            if tc.get("auto_stop", True):
-                from check_convergence import check_convergence as _cc
-                cr = _cc(log_path)
-                if cr["converged"]:
-                    print(f"\n  *** AUTO-STOP: {cr['reason']}")
-                    break
 
         if ep % 500 == 0:
             avg = np.mean(recent_costs[-500:]) if len(recent_costs) >= 500 \
@@ -851,10 +934,18 @@ def train_nn_custom(config, tc, model_dir, student_config, force):
             print(f"  Episode {ep:6,} | Avg Cost: {avg:,.0f}")
 
     torch.save(model.state_dict(), str(model_dir / "final_model.pt"))
+    _check_convergence_warning(
+        log_path=log_path,
+        label=name,
+        step=total_episodes * 50,
+        episode=total_episodes,
+        state=convergence_state,
+    )
     meta = {"steps_completed": total_episodes * 50, "episodes_completed": total_episodes,
             "wall_time_s": time.time() - start_wall,
             "best_rolling_cost": best_cost if best_cost < float("inf") else None,
             "completed_at": datetime.now().isoformat()}
+    meta = _add_convergence_metadata(meta, convergence_state)
     with open(model_dir / "training_metadata.json", "w") as f:
         json.dump(meta, f, indent=2)
     print(f"{name}: done. Saved final_model.pt")
@@ -875,11 +966,14 @@ def train_a3c(config, tc, model_dir, student_config, force):
     n_workers = tc.get("n_workers", 4)
     hidden = tc.get("hidden", 128)
     name = tc.get("portal_name", "A3C")
+    ckpt_sec = config.get("checkpoint_interval_min", 5) * 60
 
     # --- wandb init ---
     wandb_utils.init("a3c", config, tc)
 
     meta = _load_metadata(model_dir)
+    convergence_state = _convergence_state_from_meta(
+        meta if not force else None)
     if not force and meta and meta.get("episodes_completed", 0) >= total_episodes:
         print(f"{name}: already at {meta['episodes_completed']:,} episodes.")
         return
@@ -897,7 +991,7 @@ def train_a3c(config, tc, model_dir, student_config, force):
         with open(log_path, "w") as f:
             f.write("episode,timestep,episode_cost,wall_time_s,timestamp\n")
 
-    ep_start = meta.get("episodes_completed", 0) if meta else 0
+    ep_start = 0 if force else (meta.get("episodes_completed", 0) if meta else 0)
     remaining = total_episodes - ep_start
     if remaining <= 0:
         print(f"{name}: fully trained.")
@@ -924,6 +1018,7 @@ def train_a3c(config, tc, model_dir, student_config, force):
     lock = mp.Lock()
 
     start_wall = time.time()
+    last_check_wall = start_wall
     workers = []
     for i in range(n_workers):
         p = mp.Process(target=a3c_worker, args=(
@@ -934,6 +1029,25 @@ def train_a3c(config, tc, model_dir, student_config, force):
         p.start()
         workers.append(p)
 
+    # Monitor the shared log while workers train.  Convergence is advisory
+    # only; workers are never stopped by this check.
+    while any(p.is_alive() for p in workers):
+        for p in workers:
+            p.join(timeout=0.25)
+
+        now = time.time()
+        if now - last_check_wall >= ckpt_sec:
+            with lock:
+                current_ep = global_counter.value
+            _check_convergence_warning(
+                log_path=log_path,
+                label=name,
+                step=current_ep * 50,
+                episode=current_ep,
+                state=convergence_state,
+            )
+            last_check_wall = now
+
     for p in workers:
         p.join()
 
@@ -941,11 +1055,19 @@ def train_a3c(config, tc, model_dir, student_config, force):
     torch.save(shared_model.state_dict(), str(model_dir / "final_model.pt"))
     torch.save(shared_model.state_dict(), str(ckpt_path))
 
+    _check_convergence_warning(
+        log_path=log_path,
+        label=name,
+        step=total_episodes * 50,
+        episode=total_episodes,
+        state=convergence_state,
+    )
     meta = {"steps_completed": total_episodes * 50,
             "episodes_completed": total_episodes,
             "wall_time_s": time.time() - start_wall,
             "best_rolling_cost": None,
             "completed_at": datetime.now().isoformat()}
+    meta = _add_convergence_metadata(meta, convergence_state)
     with open(model_dir / "training_metadata.json", "w") as f:
         json.dump(meta, f, indent=2)
     print(f"{name}: done. Saved final_model.pt")
@@ -995,9 +1117,19 @@ def main():
                         help="Technique to train, or 'all'")
     parser.add_argument("--force", action="store_true",
                         help="Delete existing model and retrain from scratch")
-    parser.add_argument("--timesteps", type=int, default=None,
-                        help="Override total_timesteps or num_episodes")
+    budget_group = parser.add_mutually_exclusive_group()
+    budget_group.add_argument(
+        "--timesteps", type=int, default=None,
+        help="Override total_timesteps for timestep-based algorithms")
+    budget_group.add_argument(
+        "--episodes", type=int, default=None,
+        help="Override num_episodes for episode-based algorithms")
     args = parser.parse_args()
+
+    if args.technique == "all" and (
+            args.timesteps is not None or args.episodes is not None):
+        parser.error("--timesteps/--episodes cannot be used with 'all'; "
+                     "set each technique budget in config.yaml instead")
 
     config = load_config()
     student_config = get_student_config(config)
@@ -1011,11 +1143,15 @@ def main():
 
         tc = config["techniques"][tech].copy()
 
-        if args.timesteps:
-            if "num_episodes" in tc:
-                tc["num_episodes"] = args.timesteps
-            else:
-                tc["total_timesteps"] = args.timesteps
+        if args.timesteps is not None:
+            if "total_timesteps" not in tc:
+                parser.error(f"{tech} is episode-based; use --episodes instead")
+            tc["total_timesteps"] = args.timesteps
+
+        if args.episodes is not None:
+            if "num_episodes" not in tc:
+                parser.error(f"{tech} is timestep-based; use --timesteps instead")
+            tc["num_episodes"] = args.episodes
 
         print(f"\n{'='*60}")
         print(f"  {tc.get('portal_name', tech)}")
