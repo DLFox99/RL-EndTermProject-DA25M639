@@ -1,3 +1,4 @@
 # Pipeline dependencies (on top of requirements.txt)
 pyyaml>=6.0
 dvc[gdrive]>=3.50
+wandb>=0.23

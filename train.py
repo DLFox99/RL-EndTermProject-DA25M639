@@ -21,6 +21,8 @@ import numpy as np
 import pandas as pd
 import yaml
 
+import wandb_utils
+
 PROJECT_ROOT = Path(__file__).parent
 MODELS_DIR = PROJECT_ROOT / "models"
 CONFIG_PATH = PROJECT_ROOT / "config.yaml"
@@ -102,6 +104,13 @@ class PipelineCallback(BaseCallback):
                         self.best_cost = roll_avg
                         self.model.save(str(self.model_dir / "best_model"))
 
+                # --- wandb logging ---
+                roll_avg = np.mean(self.recent_costs[-100:]) \
+                    if len(self.recent_costs) >= 100 else np.mean(self.recent_costs)
+                wandb_utils.log_episode(
+                    self.episode_count, self.total_steps, ep_cost,
+                    rolling_avg=roll_avg, best_cost=self.best_cost)
+
         # --- time-based checkpoint ---
         now = time.time()
         if now - self.last_ckpt_wall >= self.checkpoint_sec:
@@ -135,6 +144,9 @@ class PipelineCallback(BaseCallback):
 
         self._write_metadata()
         self._print_status()
+        wandb_utils.log_checkpoint(
+            self.total_steps, self.episode_count,
+            self.best_cost, self._converged)
 
     def _write_metadata(self):
         meta = {
@@ -201,6 +213,9 @@ def train_sb3(algo_class, tech_name, config, tc, model_dir, student_config, forc
     total = tc["total_timesteps"]
     is_discrete = tc.get("action_type") == "discrete"
     is_offpolicy = tc.get("category") == "offpolicy"
+
+    # --- wandb init ---
+    wandb_utils.init(tech_name, config, tc)
 
     # --- skip if done ---
     meta = _load_metadata(model_dir)
@@ -338,6 +353,7 @@ def train_sb3(algo_class, tech_name, config, tc, model_dir, student_config, forc
         print(f"{tech_name}: stopped early (converged). Saved final_model.")
     else:
         print(f"{tech_name}: done. Saved final_model.")
+    wandb_utils.finish()
 
 
 # ---------------------------------------------------------------------------
@@ -357,6 +373,9 @@ def train_reinforce(config, tc, model_dir, student_config, force):
     baseline_alpha = tc.get("baseline_alpha", 0.01)
     max_grad_norm = tc.get("max_grad_norm", 1.0)
     ckpt_sec = config.get("checkpoint_interval_min", 5) * 60
+
+    # --- wandb init ---
+    wandb_utils.init("reinforce", config, tc)
 
     # --- skip if done ---
     meta = _load_metadata(model_dir)
@@ -480,6 +499,11 @@ def train_reinforce(config, tc, model_dir, student_config, force):
             f.write(f"{ep},{total_steps},{episode_cost:.2f},"
                     f"{time.time()-start_wall:.1f},{datetime.now().isoformat()}\n")
 
+        roll_avg = np.mean(recent_costs[-100:]) \
+            if len(recent_costs) >= 100 else np.mean(recent_costs)
+        wandb_utils.log_episode(ep, total_steps, episode_cost,
+                                rolling_avg=roll_avg, best_cost=best_cost)
+
         # Best model
         if len(recent_costs) >= 100:
             roll_avg = np.mean(recent_costs[-100:])
@@ -540,6 +564,7 @@ def train_reinforce(config, tc, model_dir, student_config, force):
     with open(model_dir / "training_metadata.json", "w") as f:
         json.dump(meta, f, indent=2)
     print("REINFORCE: done. Saved final_model.pt")
+    wandb_utils.finish()
 
 
 # ---------------------------------------------------------------------------
@@ -556,6 +581,9 @@ def train_tabular(config, tc, model_dir, student_config, force):
     total_episodes = tc["num_episodes"]
     ckpt_sec = config.get("checkpoint_interval_min", 5) * 60
     name = tc.get("portal_name", update_rule)
+
+    # --- wandb init ---
+    wandb_utils.init(tc.get("update_rule", "tabular"), config, tc)
 
     meta = _load_metadata(model_dir)
     if not force and meta and meta.get("episodes_completed", 0) >= total_episodes:
@@ -641,6 +669,11 @@ def train_tabular(config, tc, model_dir, student_config, force):
             f.write(f"{abs_ep},{abs_ep*50},{ep_cost:.2f},"
                     f"{time.time()-start_wall:.1f},{datetime.now().isoformat()}\n")
 
+        roll_avg = np.mean(recent_costs[-100:]) \
+            if len(recent_costs) >= 100 else np.mean(recent_costs)
+        wandb_utils.log_episode(abs_ep, abs_ep * 50, ep_cost,
+                                rolling_avg=roll_avg, best_cost=best_cost)
+
         if len(recent_costs) >= 100:
             roll_avg = np.mean(recent_costs[-100:])
             if roll_avg < best_cost:
@@ -681,6 +714,7 @@ def train_tabular(config, tc, model_dir, student_config, force):
     with open(model_dir / "training_metadata.json", "w") as f:
         json.dump(meta, f, indent=2)
     print(f"{name}: done. Saved final_model.npz")
+    wandb_utils.finish()
 
 
 # ---------------------------------------------------------------------------
@@ -700,6 +734,9 @@ def train_nn_custom(config, tc, model_dir, student_config, force):
     hidden = tc.get("hidden", 128)
     ckpt_sec = config.get("checkpoint_interval_min", 5) * 60
     name = tc.get("portal_name", update_rule)
+
+    # --- wandb init ---
+    wandb_utils.init(tc.get("update_rule", "nn_custom"), config, tc)
 
     meta = _load_metadata(model_dir)
     if not force and meta and meta.get("episodes_completed", 0) >= total_episodes:
@@ -774,6 +811,11 @@ def train_nn_custom(config, tc, model_dir, student_config, force):
             f.write(f"{ep},{ep*50},{ep_cost:.2f},"
                     f"{time.time()-start_wall:.1f},{datetime.now().isoformat()}\n")
 
+        roll_avg = np.mean(recent_costs[-100:]) \
+            if len(recent_costs) >= 100 else np.mean(recent_costs)
+        wandb_utils.log_episode(ep, ep * 50, ep_cost,
+                                rolling_avg=roll_avg, best_cost=best_cost)
+
         if len(recent_costs) >= 100:
             roll_avg = np.mean(recent_costs[-100:])
             if roll_avg < best_cost:
@@ -816,6 +858,7 @@ def train_nn_custom(config, tc, model_dir, student_config, force):
     with open(model_dir / "training_metadata.json", "w") as f:
         json.dump(meta, f, indent=2)
     print(f"{name}: done. Saved final_model.pt")
+    wandb_utils.finish()
 
 
 # ---------------------------------------------------------------------------
@@ -832,6 +875,9 @@ def train_a3c(config, tc, model_dir, student_config, force):
     n_workers = tc.get("n_workers", 4)
     hidden = tc.get("hidden", 128)
     name = tc.get("portal_name", "A3C")
+
+    # --- wandb init ---
+    wandb_utils.init("a3c", config, tc)
 
     meta = _load_metadata(model_dir)
     if not force and meta and meta.get("episodes_completed", 0) >= total_episodes:
@@ -903,6 +949,7 @@ def train_a3c(config, tc, model_dir, student_config, force):
     with open(model_dir / "training_metadata.json", "w") as f:
         json.dump(meta, f, indent=2)
     print(f"{name}: done. Saved final_model.pt")
+    wandb_utils.finish()
 
 
 # ---------------------------------------------------------------------------
