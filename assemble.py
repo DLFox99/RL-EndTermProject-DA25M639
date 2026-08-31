@@ -114,6 +114,132 @@ def run_policy(observation):
 '''
 
 
+POLICY_TABULAR = '''"""Auto-generated policy for {portal_name}."""
+import os
+import numpy as np
+
+_DIR = os.path.dirname(os.path.abspath(__file__))
+
+# Discretizer (must match training)
+_INV_EDGES = np.array({inv_edges})
+_CAP_EDGES = np.array({cap_edges})
+_DAY_EDGES = np.array({day_edges})
+_PIPE_EDGES = np.array({pipe_edges})
+_N_INV = len(_INV_EDGES) + 1
+_N_CAP = len(_CAP_EDGES) + 1
+_N_DAY = len(_DAY_EDGES) + 1
+_N_PIPE = len(_PIPE_EDGES) + 1
+
+def _discretize(obs):
+    inv = np.asarray(obs["inventory"], dtype=np.float64)
+    cap = float(obs["capacity_utilisation"])
+    day = float(obs["day"])
+    pipe_sums = np.asarray(obs["arrival_pipeline"], dtype=np.float64).sum(axis=1)
+    inv_bins = [int(np.digitize(inv[i], _INV_EDGES)) for i in range(3)]
+    cap_bin = int(np.digitize(cap, _CAP_EDGES))
+    day_bin = int(np.digitize(day, _DAY_EDGES))
+    pipe_bins = [int(np.digitize(pipe_sums[i], _PIPE_EDGES)) for i in range(3)]
+    idx = inv_bins[0]
+    idx = idx * _N_INV + inv_bins[1]
+    idx = idx * _N_INV + inv_bins[2]
+    idx = idx * _N_CAP + cap_bin
+    idx = idx * _N_DAY + day_bin
+    idx = idx * _N_PIPE + pipe_bins[0]
+    idx = idx * _N_PIPE + pipe_bins[1]
+    idx = idx * _N_PIPE + pipe_bins[2]
+    return idx
+
+_data = np.load(os.path.join(_DIR, "{model_name}"))
+_tables = [_data["q0"], _data["q1"], _data["q2"]]
+
+def run_policy(observation):
+    state = _discretize(observation)
+    actions = [int(np.argmax(_tables[i][state])) for i in range(3)]
+    return [a * 10 for a in actions]
+'''
+
+POLICY_NN_FACTORED = '''"""Auto-generated policy for {portal_name}."""
+import os
+import numpy as np
+import torch
+import torch.nn as nn
+
+def _flatten(obs):
+    inventory = np.asarray(obs["inventory"], dtype=np.float32) / 200.0
+    pipeline = np.asarray(obs["arrival_pipeline"], dtype=np.float32).flatten() / 100.0
+    demand = np.asarray(obs["demand_history"], dtype=np.float32).flatten() / 100.0
+    day = np.asarray(obs["day"], dtype=np.float32) / 50.0
+    cap = np.asarray(obs["capacity_utilisation"], dtype=np.float32)
+    return np.concatenate([inventory, pipeline, demand, day, cap])
+
+class _QNet(nn.Module):
+    def __init__(self, obs_dim=38, hidden={hidden}, n_actions=11):
+        super().__init__()
+        self.shared = nn.Sequential(
+            nn.Linear(obs_dim, hidden), nn.ReLU(),
+            nn.Linear(hidden, hidden), nn.ReLU())
+        self.heads = nn.ModuleList([nn.Linear(hidden, n_actions) for _ in range(3)])
+    def forward(self, x):
+        h = self.shared(x)
+        return [head(h) for head in self.heads]
+
+_DIR = os.path.dirname(os.path.abspath(__file__))
+_model = _QNet()
+_model.load_state_dict(torch.load(
+    os.path.join(_DIR, "{model_name}"), map_location="cpu", weights_only=True))
+_model.eval()
+
+def run_policy(observation):
+    flat = _flatten(observation)
+    obs_t = torch.FloatTensor(flat).unsqueeze(0)
+    with torch.no_grad():
+        q_values = _model(obs_t)
+    actions = [int(q.argmax(dim=-1).item()) for q in q_values]
+    return [a * 10 for a in actions]
+'''
+
+POLICY_A3C = '''"""Auto-generated policy for A3C."""
+import os
+import numpy as np
+import torch
+import torch.nn as nn
+
+def _flatten(obs):
+    inventory = np.asarray(obs["inventory"], dtype=np.float32) / 200.0
+    pipeline = np.asarray(obs["arrival_pipeline"], dtype=np.float32).flatten() / 100.0
+    demand = np.asarray(obs["demand_history"], dtype=np.float32).flatten() / 100.0
+    day = np.asarray(obs["day"], dtype=np.float32) / 50.0
+    cap = np.asarray(obs["capacity_utilisation"], dtype=np.float32)
+    return np.concatenate([inventory, pipeline, demand, day, cap])
+
+class _ActorCritic(nn.Module):
+    def __init__(self, obs_dim=38, hidden={hidden}, n_actions=11):
+        super().__init__()
+        self.shared = nn.Sequential(
+            nn.Linear(obs_dim, hidden), nn.ReLU(),
+            nn.Linear(hidden, hidden), nn.ReLU())
+        self.actor_heads = nn.ModuleList([nn.Linear(hidden, n_actions) for _ in range(3)])
+        self.critic = nn.Linear(hidden, 1)
+    def forward(self, x):
+        h = self.shared(x)
+        return [head(h) for head in self.actor_heads], self.critic(h)
+
+_DIR = os.path.dirname(os.path.abspath(__file__))
+_model = _ActorCritic()
+_model.load_state_dict(torch.load(
+    os.path.join(_DIR, "{model_name}"), map_location="cpu", weights_only=True))
+_model.eval()
+
+def run_policy(observation):
+    flat = _flatten(observation)
+    obs_t = torch.FloatTensor(flat).unsqueeze(0)
+    with torch.no_grad():
+        logits, _ = _model(obs_t)
+    actions = [int(l.argmax(dim=-1).item()) for l in logits]
+    return [a * 10 for a in actions]
+'''
+
+
 def assemble_technique(tech_name, tc):
     """Generate policy.py, copy model, create upload zip."""
     model_dir = MODELS_DIR / tech_name
@@ -125,41 +251,69 @@ def assemble_technique(tech_name, tc):
     portal_name = tc.get("portal_name", tech_name)
 
     # --- Determine model source (prefer best_model) ---
-    if category == "reinforce":
-        if (model_dir / "best_model.pt").exists():
-            src_model = model_dir / "best_model.pt"
-        elif (model_dir / "final_model.pt").exists():
-            src_model = model_dir / "final_model.pt"
-        else:
-            print(f"  {tech_name}: no model found, skipping")
-            return False
-        model_artifact = f"{tech_name}_model.pt"
+    ext_map = {
+        "onpolicy": ".zip", "offpolicy": ".zip",
+        "reinforce": ".pt", "a3c": ".pt",
+        "nn_custom": ".pt", "tabular": ".npz",
+    }
+    ext = ext_map.get(category, ".zip")
+
+    best_path = model_dir / f"best_model{ext}"
+    final_path = model_dir / f"final_model{ext}"
+
+    if best_path.exists():
+        src_model = best_path
+    elif final_path.exists():
+        src_model = final_path
     else:
-        if (model_dir / "best_model.zip").exists():
-            src_model = model_dir / "best_model.zip"
-        elif (model_dir / "final_model.zip").exists():
-            src_model = model_dir / "final_model.zip"
-        else:
-            print(f"  {tech_name}: no model found, skipping")
-            return False
-        model_artifact = f"{tech_name}_model.zip"
+        print(f"  {tech_name}: no model found, skipping")
+        return False
+
+    model_artifact = f"{tech_name}_model{ext}"
 
     # model_name for SB3 load() — WITHOUT .zip extension
     model_name_for_load = model_artifact.replace(".zip", "") \
         if model_artifact.endswith(".zip") else model_artifact
 
     # --- Generate policy.py ---
-    if category == "reinforce":
-        code = POLICY_REINFORCE.format(
+    if category == "tabular":
+        # Load discretizer config
+        disc_cfg_path = model_dir / "discretizer_config.json"
+        if disc_cfg_path.exists():
+            import json as _json
+            with open(disc_cfg_path) as f:
+                disc_cfg = _json.load(f)
+        else:
+            # Defaults matching StateDiscretizer
+            disc_cfg = {"inv_edges": [30, 60, 100, 150],
+                        "cap_edges": [0.3, 0.6, 0.85],
+                        "day_edges": [12, 25, 38],
+                        "pipe_edges": [30, 80]}
+        code = POLICY_TABULAR.format(
+            portal_name=portal_name,
             model_name=model_artifact,
-            hidden=tc.get("hidden", 128),
+            inv_edges=disc_cfg["inv_edges"],
+            cap_edges=disc_cfg["cap_edges"],
+            day_edges=disc_cfg["day_edges"],
+            pipe_edges=disc_cfg["pipe_edges"],
         )
+    elif category in ("reinforce", "nn_custom"):
+        hidden = tc.get("hidden", 128)
+        if category == "nn_custom":
+            code = POLICY_NN_FACTORED.format(
+                portal_name=portal_name, model_name=model_artifact, hidden=hidden)
+        else:
+            code = POLICY_REINFORCE.format(
+                model_name=model_artifact, hidden=hidden)
+    elif category == "a3c":
+        code = POLICY_A3C.format(
+            model_name=model_artifact, hidden=tc.get("hidden", 128))
     else:
-        # Determine import
+        # SB3 models
         algo = tc["algo"]
         if algo == "DoubleDQN":
             import_module = "stable_baselines3"
-            import_class = "DQN"  # Load with DQN at inference
+            import_class = "DQN"
         else:
             import_module = "stable_baselines3"
             import_class = algo

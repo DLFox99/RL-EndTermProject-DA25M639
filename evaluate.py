@@ -35,26 +35,68 @@ def build_policy_fn(tech_name, tc, model_dir):
     action_type = tc.get("action_type", "multi")
     category = tc.get("category", "onpolicy")
 
-    if category == "reinforce":
-        import torch
-        from reinforce_agent import ReinforcePolicy
+    if category == "tabular":
+        from tabular_agent import StateDiscretizer, TabularAgent
 
-        # Prefer best_model, fall back to final
+        discretizer = StateDiscretizer()
+        agent = TabularAgent(discretizer.n_states)
+
+        model_path = model_dir / "best_model.npz"
+        if not model_path.exists():
+            model_path = model_dir / "final_model.npz"
+        agent.load(str(model_path))
+
+        def fn(obs):
+            state = discretizer.discretize(obs)
+            actions = agent.get_greedy_actions(state)
+            return [a * 10 for a in actions]
+        return fn
+
+    elif category in ("reinforce", "a3c"):
+        import torch
+        if category == "a3c":
+            from a3c_agent import ActorCritic as NetClass
+        else:
+            from reinforce_agent import ReinforcePolicy as NetClass
+
         model_path = model_dir / "best_model.pt"
         if not model_path.exists():
             model_path = model_dir / "final_model.pt"
 
-        policy_net = ReinforcePolicy(hidden=tc.get("hidden", 128))
-        policy_net.load_state_dict(
+        net = NetClass(hidden=tc.get("hidden", 128))
+        net.load_state_dict(
             torch.load(str(model_path), map_location="cpu", weights_only=True))
-        policy_net.eval()
+        net.eval()
 
         def fn(obs):
             flat = flatten_observation(obs)
             obs_t = torch.FloatTensor(flat).unsqueeze(0)
             with torch.no_grad():
-                logits = policy_net(obs_t)
+                logits = net(obs_t) if category == "reinforce" \
+                    else net(obs_t)[0]  # A3C returns (logits, value)
             actions = [int(l.argmax(dim=-1).item()) for l in logits]
+            return [a * 10 for a in actions]
+        return fn
+
+    elif category == "nn_custom":
+        import torch
+        from nn_agent import QNetworkFactored
+
+        model_path = model_dir / "best_model.pt"
+        if not model_path.exists():
+            model_path = model_dir / "final_model.pt"
+
+        net = QNetworkFactored(hidden=tc.get("hidden", 128))
+        net.load_state_dict(
+            torch.load(str(model_path), map_location="cpu", weights_only=True))
+        net.eval()
+
+        def fn(obs):
+            flat = flatten_observation(obs)
+            obs_t = torch.FloatTensor(flat).unsqueeze(0)
+            with torch.no_grad():
+                q_values = net(obs_t)
+            actions = [int(q.argmax(dim=-1).item()) for q in q_values]
             return [a * 10 for a in actions]
         return fn
 
@@ -99,11 +141,10 @@ def evaluate_technique(tech_name, tc, config, student_config, force=False):
     model_dir = MODELS_DIR / tech_name
 
     # Check model exists
-    has_model = (
-        (model_dir / "final_model.zip").exists()
-        or (model_dir / "final_model.pt").exists()
-        or (model_dir / "best_model.zip").exists()
-        or (model_dir / "best_model.pt").exists()
+    has_model = any(
+        (model_dir / f).exists()
+        for f in ["final_model.zip", "final_model.pt", "final_model.npz",
+                   "best_model.zip", "best_model.pt", "best_model.npz"]
     )
     if not has_model:
         print(f"{tech_name}: no model found in {model_dir}. Train first.")

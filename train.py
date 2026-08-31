@@ -468,6 +468,332 @@ def train_reinforce(config, tc, model_dir, student_config, force):
 
 
 # ---------------------------------------------------------------------------
+# Tabular trainer (Q-Learning, SARSA, TD(λ))
+# ---------------------------------------------------------------------------
+
+def train_tabular(config, tc, model_dir, student_config, force):
+    from tabular_agent import StateDiscretizer, TabularAgent
+    from tabular_agent import (train_tabular_qlearning, train_tabular_sarsa,
+                               train_td_lambda)
+    from industrial_inventory_env import IndustrialInventoryEnv
+
+    update_rule = tc["update_rule"]
+    total_episodes = tc["num_episodes"]
+    ckpt_sec = config.get("checkpoint_interval_min", 5) * 60
+    name = tc.get("portal_name", update_rule)
+
+    meta = _load_metadata(model_dir)
+    if not force and meta and meta.get("episodes_completed", 0) >= total_episodes:
+        print(f"{name}: already at {meta['episodes_completed']:,} episodes.")
+        return
+
+    discretizer = StateDiscretizer()
+    agent = TabularAgent(discretizer.n_states)
+
+    ckpt_path = model_dir / "checkpoints" / "checkpoint.npz"
+    ep_start = 0
+    best_cost = float("inf")
+
+    if not force and ckpt_path.exists():
+        print(f"{name}: resuming from checkpoint")
+        agent.load(str(ckpt_path))
+        if meta:
+            ep_start = meta.get("episodes_completed", 0)
+            best_cost = meta.get("best_rolling_cost") or float("inf")
+    elif force:
+        for f in model_dir.iterdir():
+            if f.is_file(): f.unlink()
+        (model_dir / "checkpoints").mkdir(exist_ok=True)
+
+    with open(model_dir / "hyperparams_used.yaml", "w") as f:
+        yaml.dump(tc, f, default_flow_style=False)
+
+    remaining = total_episodes - ep_start
+    if remaining <= 0:
+        print(f"{name}: fully trained.")
+        return
+
+    print(f"{name}: training episodes {ep_start:,} → {total_episodes:,}")
+
+    env = IndustrialInventoryEnv(student_config, scenario_mode="random",
+                                  domain_randomization=True)
+
+    log_path = model_dir / "train_log.csv"
+    if not log_path.exists() or log_path.stat().st_size == 0:
+        with open(log_path, "w") as f:
+            f.write("episode,timestep,episode_cost,wall_time_s,timestamp\n")
+
+    # Save discretizer config for policy generation
+    import json as _json
+    with open(model_dir / "discretizer_config.json", "w") as f:
+        _json.dump(discretizer.config_dict(), f)
+
+    kwargs = dict(
+        env=env, discretizer=discretizer, agent=agent,
+        num_episodes=remaining,
+        alpha=tc.get("alpha", 0.1), gamma=tc.get("gamma", 0.99),
+        epsilon_start=tc.get("epsilon_start", 1.0),
+        epsilon_end=tc.get("epsilon_end", 0.05),
+    )
+
+    if update_rule == "qlearning":
+        gen = train_tabular_qlearning(**kwargs)
+    elif update_rule == "sarsa":
+        gen = train_tabular_sarsa(**kwargs)
+    elif update_rule == "td_lambda":
+        kwargs["lambd"] = tc.get("lambd", 0.8)
+        gen = train_td_lambda(**kwargs)
+
+    start_wall = time.time()
+    last_ckpt_wall = start_wall
+    recent_costs = []
+
+    for rel_ep, ep_cost in gen:
+        abs_ep = ep_start + rel_ep + 1
+        recent_costs.append(ep_cost)
+
+        with open(log_path, "a") as f:
+            f.write(f"{abs_ep},{abs_ep*50},{ep_cost:.2f},"
+                    f"{time.time()-start_wall:.1f},{datetime.now().isoformat()}\n")
+
+        if len(recent_costs) >= 100:
+            roll_avg = np.mean(recent_costs[-100:])
+            if roll_avg < best_cost:
+                best_cost = roll_avg
+                agent.save(str(model_dir / "best_model.npz"))
+
+        now = time.time()
+        if now - last_ckpt_wall >= ckpt_sec:
+            agent.save(str(ckpt_path))
+            meta = {"steps_completed": abs_ep * 50, "episodes_completed": abs_ep,
+                    "wall_time_s": now - start_wall,
+                    "best_rolling_cost": best_cost if best_cost < float("inf") else None,
+                    "last_checkpoint": datetime.now().isoformat()}
+            with open(model_dir / "training_metadata.json", "w") as f:
+                json.dump(meta, f, indent=2)
+            avg = np.mean(recent_costs[-100:]) if recent_costs else 0
+            print(f"  [checkpoint] ep={abs_ep:,}  avg={avg:,.0f}  best={best_cost:,.0f}")
+            last_ckpt_wall = now
+
+        if abs_ep % 2000 == 0:
+            avg = np.mean(recent_costs[-2000:]) if len(recent_costs) >= 2000 \
+                else np.mean(recent_costs)
+            print(f"  Episode {abs_ep:6,} | Avg Cost: {avg:,.0f}")
+
+    agent.save(str(model_dir / "final_model.npz"))
+    meta = {"steps_completed": total_episodes * 50, "episodes_completed": total_episodes,
+            "wall_time_s": time.time() - start_wall,
+            "best_rolling_cost": best_cost if best_cost < float("inf") else None,
+            "completed_at": datetime.now().isoformat()}
+    with open(model_dir / "training_metadata.json", "w") as f:
+        json.dump(meta, f, indent=2)
+    print(f"{name}: done. Saved final_model.npz")
+
+
+# ---------------------------------------------------------------------------
+# NN Q-Learning / NN SARSA trainer
+# ---------------------------------------------------------------------------
+
+def train_nn_custom(config, tc, model_dir, student_config, force):
+    import torch
+    from nn_agent import QNetworkFactored, train_nn_qlearning_episode, train_nn_sarsa_episode
+    from env_wrappers import flatten_observation
+    from industrial_inventory_env import IndustrialInventoryEnv
+
+    update_rule = tc["update_rule"]
+    total_episodes = tc["num_episodes"]
+    lr = tc["learning_rate"]
+    gamma = tc.get("gamma", 0.99)
+    hidden = tc.get("hidden", 128)
+    ckpt_sec = config.get("checkpoint_interval_min", 5) * 60
+    name = tc.get("portal_name", update_rule)
+
+    meta = _load_metadata(model_dir)
+    if not force and meta and meta.get("episodes_completed", 0) >= total_episodes:
+        print(f"{name}: already at {meta['episodes_completed']:,} episodes.")
+        return
+
+    model = QNetworkFactored(hidden=hidden)
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+
+    ckpt_path = model_dir / "checkpoints" / "checkpoint.pt"
+    ep_start = 0
+    best_cost = float("inf")
+
+    if not force and ckpt_path.exists():
+        print(f"{name}: resuming from checkpoint")
+        ckpt_data = torch.load(str(ckpt_path), map_location="cpu", weights_only=False)
+        model.load_state_dict(ckpt_data["model_state"])
+        optimizer.load_state_dict(ckpt_data["optimizer_state"])
+        ep_start = ckpt_data.get("episode", 0)
+        best_cost = ckpt_data.get("best_cost", float("inf"))
+    elif force:
+        for f in model_dir.iterdir():
+            if f.is_file(): f.unlink()
+        (model_dir / "checkpoints").mkdir(exist_ok=True)
+
+    with open(model_dir / "hyperparams_used.yaml", "w") as f:
+        yaml.dump(tc, f, default_flow_style=False)
+
+    if ep_start >= total_episodes:
+        print(f"{name}: fully trained.")
+        return
+
+    print(f"{name}: training episodes {ep_start:,} → {total_episodes:,}")
+
+    env = IndustrialInventoryEnv(student_config, scenario_mode="random",
+                                  domain_randomization=True)
+
+    log_path = model_dir / "train_log.csv"
+    if not log_path.exists() or log_path.stat().st_size == 0:
+        with open(log_path, "w") as f:
+            f.write("episode,timestep,episode_cost,wall_time_s,timestamp\n")
+
+    train_fn = train_nn_qlearning_episode if update_rule == "qlearning" \
+        else train_nn_sarsa_episode
+
+    eps_start = tc.get("epsilon_start", 1.0)
+    eps_end = tc.get("epsilon_end", 0.05)
+    eps_decay = int(total_episodes * 0.7)
+
+    start_wall = time.time()
+    last_ckpt_wall = start_wall
+    recent_costs = []
+
+    for ep in range(ep_start + 1, total_episodes + 1):
+        epsilon = max(eps_end, eps_start - (eps_start - eps_end) * ep / eps_decay)
+        ep_cost = train_fn(env, model, optimizer, flatten_observation,
+                           gamma=gamma, epsilon=epsilon)
+        recent_costs.append(ep_cost)
+
+        with open(log_path, "a") as f:
+            f.write(f"{ep},{ep*50},{ep_cost:.2f},"
+                    f"{time.time()-start_wall:.1f},{datetime.now().isoformat()}\n")
+
+        if len(recent_costs) >= 100:
+            roll_avg = np.mean(recent_costs[-100:])
+            if roll_avg < best_cost:
+                best_cost = roll_avg
+                torch.save(model.state_dict(), str(model_dir / "best_model.pt"))
+
+        now = time.time()
+        if now - last_ckpt_wall >= ckpt_sec:
+            torch.save({"model_state": model.state_dict(),
+                        "optimizer_state": optimizer.state_dict(),
+                        "episode": ep, "best_cost": best_cost}, str(ckpt_path))
+            meta = {"steps_completed": ep * 50, "episodes_completed": ep,
+                    "wall_time_s": now - start_wall,
+                    "best_rolling_cost": best_cost if best_cost < float("inf") else None,
+                    "last_checkpoint": datetime.now().isoformat()}
+            with open(model_dir / "training_metadata.json", "w") as f:
+                json.dump(meta, f, indent=2)
+            avg = np.mean(recent_costs[-100:]) if recent_costs else 0
+            print(f"  [checkpoint] ep={ep:,}  avg={avg:,.0f}  best={best_cost:,.0f}")
+            last_ckpt_wall = now
+
+        if ep % 500 == 0:
+            avg = np.mean(recent_costs[-500:]) if len(recent_costs) >= 500 \
+                else np.mean(recent_costs)
+            print(f"  Episode {ep:6,} | Avg Cost: {avg:,.0f}")
+
+    torch.save(model.state_dict(), str(model_dir / "final_model.pt"))
+    meta = {"steps_completed": total_episodes * 50, "episodes_completed": total_episodes,
+            "wall_time_s": time.time() - start_wall,
+            "best_rolling_cost": best_cost if best_cost < float("inf") else None,
+            "completed_at": datetime.now().isoformat()}
+    with open(model_dir / "training_metadata.json", "w") as f:
+        json.dump(meta, f, indent=2)
+    print(f"{name}: done. Saved final_model.pt")
+
+
+# ---------------------------------------------------------------------------
+# A3C trainer
+# ---------------------------------------------------------------------------
+
+def train_a3c(config, tc, model_dir, student_config, force):
+    import torch
+    import torch.multiprocessing as mp
+    from a3c_agent import ActorCritic, SharedAdam, a3c_worker
+    from env_wrappers import flatten_observation
+
+    total_episodes = tc["num_episodes"]
+    n_workers = tc.get("n_workers", 4)
+    hidden = tc.get("hidden", 128)
+    name = tc.get("portal_name", "A3C")
+
+    meta = _load_metadata(model_dir)
+    if not force and meta and meta.get("episodes_completed", 0) >= total_episodes:
+        print(f"{name}: already at {meta['episodes_completed']:,} episodes.")
+        return
+
+    if force:
+        for f in model_dir.iterdir():
+            if f.is_file(): f.unlink()
+        (model_dir / "checkpoints").mkdir(exist_ok=True)
+
+    with open(model_dir / "hyperparams_used.yaml", "w") as f:
+        yaml.dump(tc, f, default_flow_style=False)
+
+    log_path = model_dir / "train_log.csv"
+    if not log_path.exists() or log_path.stat().st_size == 0:
+        with open(log_path, "w") as f:
+            f.write("episode,timestep,episode_cost,wall_time_s,timestamp\n")
+
+    ep_start = meta.get("episodes_completed", 0) if meta else 0
+    remaining = total_episodes - ep_start
+    if remaining <= 0:
+        print(f"{name}: fully trained.")
+        return
+
+    print(f"{name}: training {remaining:,} episodes with {n_workers} workers")
+
+    try:
+        mp.set_start_method("spawn", force=True)
+    except RuntimeError:
+        pass
+
+    shared_model = ActorCritic(hidden=hidden)
+    ckpt_path = model_dir / "checkpoints" / "checkpoint.pt"
+    if not force and ckpt_path.exists():
+        shared_model.load_state_dict(
+            torch.load(str(ckpt_path), map_location="cpu", weights_only=True))
+        print(f"{name}: loaded checkpoint")
+    shared_model.share_memory()
+
+    shared_optimizer = SharedAdam(shared_model.parameters(),
+                                  lr=tc.get("learning_rate", 1e-4))
+    global_counter = mp.Value("i", ep_start)
+    lock = mp.Lock()
+
+    start_wall = time.time()
+    workers = []
+    for i in range(n_workers):
+        p = mp.Process(target=a3c_worker, args=(
+            i, shared_model, shared_optimizer, student_config,
+            flatten_observation, 50, total_episodes, global_counter, lock,
+            str(log_path), tc.get("gamma", 0.99), tc.get("ent_coef", 0.01),
+            tc.get("max_grad_norm", 1.0), hidden))
+        p.start()
+        workers.append(p)
+
+    for p in workers:
+        p.join()
+
+    # Save final model
+    torch.save(shared_model.state_dict(), str(model_dir / "final_model.pt"))
+    torch.save(shared_model.state_dict(), str(ckpt_path))
+
+    meta = {"steps_completed": total_episodes * 50,
+            "episodes_completed": total_episodes,
+            "wall_time_s": time.time() - start_wall,
+            "best_rolling_cost": None,
+            "completed_at": datetime.now().isoformat()}
+    with open(model_dir / "training_metadata.json", "w") as f:
+        json.dump(meta, f, indent=2)
+    print(f"{name}: done. Saved final_model.pt")
+
+
+# ---------------------------------------------------------------------------
 # Technique registry
 # ---------------------------------------------------------------------------
 
@@ -485,11 +811,17 @@ def _make_trainer(algo_name, category):
 
 
 TRAINERS = {
-    "ppo":       _make_trainer("PPO", "onpolicy"),
-    "a2c":       _make_trainer("A2C", "onpolicy"),
-    "dqn":       _make_trainer("DQN", "offpolicy"),
-    "ddqn":      _make_trainer("DoubleDQN", "offpolicy"),
-    "reinforce": train_reinforce,
+    "ppo":               _make_trainer("PPO", "onpolicy"),
+    "a2c":               _make_trainer("A2C", "onpolicy"),
+    "dqn":               _make_trainer("DQN", "offpolicy"),
+    "ddqn":              _make_trainer("DoubleDQN", "offpolicy"),
+    "reinforce":         train_reinforce,
+    "a3c":               train_a3c,
+    "tabular_qlearning": train_tabular,
+    "tabular_sarsa":     train_tabular,
+    "td_lambda":         train_tabular,
+    "nn_qlearning":      train_nn_custom,
+    "nn_sarsa":          train_nn_custom,
 }
 
 
@@ -505,7 +837,7 @@ def main():
     parser.add_argument("--force", action="store_true",
                         help="Delete existing model and retrain from scratch")
     parser.add_argument("--timesteps", type=int, default=None,
-                        help="Override total_timesteps (or num_episodes for REINFORCE)")
+                        help="Override total_timesteps or num_episodes")
     args = parser.parse_args()
 
     config = load_config()
@@ -520,9 +852,8 @@ def main():
 
         tc = config["techniques"][tech].copy()
 
-        # Override timesteps if requested
         if args.timesteps:
-            if tech == "reinforce":
+            if "num_episodes" in tc:
                 tc["num_episodes"] = args.timesteps
             else:
                 tc["total_timesteps"] = args.timesteps

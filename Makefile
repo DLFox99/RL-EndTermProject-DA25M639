@@ -2,7 +2,7 @@
        clean dvc-push dvc-pull plot-all help
 
 PYTHON ?= python3
-TECHNIQUES := ppo a2c dqn ddqn reinforce
+TECHNIQUES := ppo a2c dqn ddqn reinforce a3c tabular_qlearning tabular_sarsa td_lambda nn_qlearning nn_sarsa
 
 # ---- Help (default) ----
 

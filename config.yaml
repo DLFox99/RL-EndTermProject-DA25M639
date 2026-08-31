@@ -8,10 +8,11 @@ evaluation:
   scenario_modes: ["stationary", "seasonal", "trend", "shock", "random"]
 
 techniques:
+  # ---- SB3 On-Policy ----
   ppo:
     algo: PPO
-    category: onpolicy          # onpolicy | offpolicy | reinforce
-    action_type: multi          # multi | discrete
+    category: onpolicy
+    action_type: multi
     portal_name: "Proximal Policy Optimization (PPO)"
     total_timesteps: 5000000
     n_envs: 4
@@ -39,6 +40,7 @@ techniques:
     ent_coef: 0.01
     net_arch: [256, 128]
 
+  # ---- SB3 Off-Policy ----
   dqn:
     algo: DQN
     category: offpolicy
@@ -81,6 +83,7 @@ techniques:
     target_update_interval: 1000
     net_arch: [256, 128]
 
+  # ---- Custom Policy Gradient ----
   reinforce:
     algo: REINFORCE
     category: reinforce
@@ -92,3 +95,81 @@ techniques:
     hidden: 128
     max_grad_norm: 1.0
     baseline_alpha: 0.01
+
+  a3c:
+    algo: A3C
+    category: a3c
+    action_type: multi
+    portal_name: "A3C"
+    num_episodes: 20000
+    n_workers: 4
+    learning_rate: 1.0e-4
+    gamma: 0.99
+    hidden: 128
+    ent_coef: 0.01
+    max_grad_norm: 1.0
+
+  # ---- Tabular ----
+  tabular_qlearning:
+    algo: TabularQLearning
+    category: tabular
+    action_type: multi
+    update_rule: qlearning
+    portal_name: "Tabular Q-Learning"
+    num_episodes: 50000
+    alpha: 0.1
+    gamma: 0.99
+    epsilon_start: 1.0
+    epsilon_end: 0.05
+
+  tabular_sarsa:
+    algo: TabularSARSA
+    category: tabular
+    action_type: multi
+    update_rule: sarsa
+    portal_name: "Tabular SARSA"
+    num_episodes: 50000
+    alpha: 0.1
+    gamma: 0.99
+    epsilon_start: 1.0
+    epsilon_end: 0.05
+
+  td_lambda:
+    algo: TDLambda
+    category: tabular
+    action_type: multi
+    update_rule: td_lambda
+    portal_name: "TD(lambda) with Eligibility Traces"
+    num_episodes: 50000
+    alpha: 0.05
+    gamma: 0.99
+    lambd: 0.8
+    epsilon_start: 1.0
+    epsilon_end: 0.05
+
+  # ---- Custom NN ----
+  nn_qlearning:
+    algo: NNQLearning
+    category: nn_custom
+    action_type: multi
+    update_rule: qlearning
+    portal_name: "Neural Network based Q-Learning"
+    num_episodes: 20000
+    learning_rate: 1.0e-3
+    gamma: 0.99
+    hidden: 128
+    epsilon_start: 1.0
+    epsilon_end: 0.05
+
+  nn_sarsa:
+    algo: NNSarsa
+    category: nn_custom
+    action_type: multi
+    update_rule: sarsa
+    portal_name: "Neural Network based SARSA"
+    num_episodes: 20000
+    learning_rate: 1.0e-3
+    gamma: 0.99
+    hidden: 128
+    epsilon_start: 1.0
+    epsilon_end: 0.05
