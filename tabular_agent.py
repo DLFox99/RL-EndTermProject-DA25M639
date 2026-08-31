@@ -32,8 +32,8 @@ class StateDiscretizer:
 
     def discretize(self, obs):
         inv = np.asarray(obs["inventory"], dtype=np.float64)
-        cap = float(obs["capacity_utilisation"])
-        day = float(obs["day"])
+        cap = np.asarray(obs["capacity_utilisation"], dtype=np.float64).item()
+        day = np.asarray(obs["day"], dtype=np.float64).item()
         pipeline = np.asarray(obs["arrival_pipeline"], dtype=np.float64)
         pipe_sums = pipeline.sum(axis=1)  # per-product pipeline load
 
