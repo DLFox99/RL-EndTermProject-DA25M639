@@ -4,3 +4,4 @@
 /ppo
 /reinforce
 /tabular_sarsa
+/tabular_qlearning
