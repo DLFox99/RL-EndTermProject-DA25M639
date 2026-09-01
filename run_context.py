@@ -243,6 +243,22 @@ class RunContext:
         self.initial_rows = [] if self.force else _read_training_rows(self.log_path)
         self.initial_row_count = 0 if self.force else len(self.initial_rows)
 
+        self.eval_metrics_path = self.model_dir / "eval_metrics.csv"
+        self.evaluations_path = self.model_dir / "evaluations"
+        if self.force:
+            self.initial_eval_row_count = 0
+            self.initial_evaluation_files = set()
+        else:
+            try:
+                with self.eval_metrics_path.open(newline="", encoding="utf-8") as f:
+                    self.initial_eval_row_count = sum(1 for _ in csv.DictReader(f))
+            except Exception:
+                self.initial_eval_row_count = 0
+            self.initial_evaluation_files = (
+                {p.name for p in self.evaluations_path.glob("*.json")}
+                if self.evaluations_path.exists() else set()
+            )
+
         self.target_unit, self.target_total = self._target()
         self.start_progress = self._initial_progress()
         self.progress_interval_s = float(
@@ -437,6 +453,7 @@ class RunContext:
             "summary_file": "summary.json",
             "resolved_config_file": "resolved_config.yaml",
             "metrics_file": "train_metrics.csv",
+            "eval_metrics_file": "eval_metrics.csv",
             "failure": None,
         }
 
@@ -676,9 +693,11 @@ class RunContext:
         candidates: List[Path] = []
         for pattern in (
             "best_model.*",
+            "best_eval_model.*",
             "final_model.*",
             "hyperparams_used.yaml",
             "training_metadata.json",
+            "evaluation_metadata.json",
             "discretizer_config.json",
         ):
             candidates.extend(sorted(self.model_dir.glob(pattern)))
@@ -709,6 +728,50 @@ class RunContext:
                 copied[str(rel)] = {"copy_error": str(exc)}
         return copied
 
+    def _copy_evaluation_records(self) -> Dict[str, Any]:
+        """Copy only this invocation's periodic-evaluation records."""
+        copied = {
+            "metrics": False, "rows": 0, "detail_files": 0,
+            "evaluation_wall_time_s": 0.0,
+        }
+        src_csv = self.model_dir / "eval_metrics.csv"
+        if src_csv.exists() and src_csv.is_file():
+            try:
+                with src_csv.open(newline="", encoding="utf-8") as f:
+                    rows = list(csv.DictReader(f))
+                run_rows = rows[self.initial_eval_row_count:]
+                if run_rows:
+                    dst = self.run_dir / "eval_metrics.csv"
+                    with dst.open("w", newline="", encoding="utf-8") as f:
+                        writer = csv.DictWriter(f, fieldnames=list(run_rows[0].keys()))
+                        writer.writeheader()
+                        writer.writerows(run_rows)
+                    copied["metrics"] = True
+                    copied["rows"] = len(run_rows)
+                    total_eval_wall = 0.0
+                    for row in run_rows:
+                        try:
+                            total_eval_wall += float(row.get("eval_wall_time_s", 0) or 0)
+                        except (TypeError, ValueError):
+                            pass
+                    copied["evaluation_wall_time_s"] = total_eval_wall
+            except Exception as exc:
+                copied["metrics_error"] = str(exc)
+
+        src_dir = self.model_dir / "evaluations"
+        if src_dir.exists() and src_dir.is_dir():
+            dst_dir = self.run_dir / "evaluations"
+            for src in sorted(src_dir.glob("*.json")):
+                if not src.is_file() or src.name in self.initial_evaluation_files:
+                    continue
+                try:
+                    dst_dir.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(src, dst_dir / src.name)
+                    copied["detail_files"] += 1
+                except Exception:
+                    pass
+        return copied
+
     def _finalize(self, *, status: str, failure: Optional[Dict[str, Any]]) -> None:
         assert self.started_monotonic is not None
         wall = time.monotonic() - self.started_monotonic
@@ -723,6 +786,8 @@ class RunContext:
         self._write_metrics_csv(run_rows)
         perf = self._rolling_summary(all_rows, run_rows)
         artifacts = self._copy_artifacts()
+        evaluation_records = self._copy_evaluation_records()
+        evaluation_meta = _read_json(self.model_dir / "evaluation_metadata.json")
 
         final_meta = _read_json(self.metadata_path)
         final_steps = final_meta.get("steps_completed")
@@ -754,6 +819,13 @@ class RunContext:
             if trainer_wall is not None and trainer_wall >= 0
             else None
         )
+        evaluation_wall = float(
+            evaluation_records.get("evaluation_wall_time_s", 0.0) or 0.0)
+        learning_wall = (
+            max(trainer_wall - evaluation_wall, 0.0)
+            if trainer_wall is not None and trainer_wall >= 0
+            else None
+        )
 
         summary = {
             "run_id": self.run_id,
@@ -767,6 +839,8 @@ class RunContext:
             # Trainer-reported learning-loop time, when the trainer provides it.
             "trainer_wall_time_s": trainer_wall,
             "framework_overhead_s": framework_overhead,
+            "evaluation_wall_time_s": evaluation_wall,
+            "learning_wall_time_s": learning_wall,
             "start_steps": start_steps,
             "completed_steps": final_steps,
             "steps_this_run": delta_steps,
@@ -774,6 +848,11 @@ class RunContext:
             "steps_per_second_training": (
                 delta_steps / trainer_wall
                 if trainer_wall is not None and trainer_wall > 0 and delta_steps > 0
+                else None
+            ),
+            "steps_per_second_learning_only": (
+                delta_steps / learning_wall
+                if learning_wall is not None and learning_wall > 0 and delta_steps > 0
                 else None
             ),
             "start_episodes": start_episodes,
@@ -785,6 +864,15 @@ class RunContext:
                 if trainer_wall is not None and trainer_wall > 0 and delta_episodes > 0
                 else None
             ),
+            "episodes_per_second_learning_only": (
+                delta_episodes / learning_wall
+                if learning_wall is not None and learning_wall > 0 and delta_episodes > 0
+                else None
+            ),
+            "best_eval_mean_cost": evaluation_meta.get("best_mean_cost"),
+            "evaluations_completed": evaluation_meta.get("evaluations_completed", 0),
+            "evaluation_selection_episodes": evaluation_meta.get(
+                "episodes_per_evaluation"),
             **perf,
         }
         _atomic_json(self.run_dir / "summary.json", summary)
@@ -796,6 +884,7 @@ class RunContext:
                 "wall_time_s": wall,
                 "failure": failure,
                 "artifacts": artifacts,
+                "evaluation_records": evaluation_records,
                 "result": {
                     "steps_completed": final_steps,
                     "episodes_completed": final_episodes,
@@ -804,16 +893,25 @@ class RunContext:
                     "total_wall_time_s": summary["total_wall_time_s"],
                     "trainer_wall_time_s": summary["trainer_wall_time_s"],
                     "framework_overhead_s": summary["framework_overhead_s"],
+                    "evaluation_wall_time_s": summary["evaluation_wall_time_s"],
+                    "learning_wall_time_s": summary["learning_wall_time_s"],
                     "steps_per_second": summary["steps_per_second"],
                     "steps_per_second_training": summary["steps_per_second_training"],
+                    "steps_per_second_learning_only": summary[
+                        "steps_per_second_learning_only"],
                     "episodes_per_second": summary["episodes_per_second"],
                     "episodes_per_second_training": summary["episodes_per_second_training"],
+                    "episodes_per_second_learning_only": summary[
+                        "episodes_per_second_learning_only"],
                     "trainer_best_rolling_cost": perf.get("trainer_best_rolling_cost"),
                     "best_observed_rolling100_cost": perf.get("best_observed_rolling100_cost"),
                     "final_observed_rolling100_cost": perf.get("final_observed_rolling100_cost"),
                     "best_episode": perf.get("best_episode"),
                     "best_timestep": perf.get("best_timestep"),
                     "time_to_best_s": perf.get("time_to_best_s"),
+                    "best_eval_mean_cost": evaluation_meta.get("best_mean_cost"),
+                    "evaluations_completed": evaluation_meta.get(
+                        "evaluations_completed", 0),
                 },
             }
         )

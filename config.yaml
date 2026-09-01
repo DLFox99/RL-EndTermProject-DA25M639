@@ -7,9 +7,20 @@ wandb:
   project: "rl-inventory"
 
 evaluation:
+  # Full offline validation set used by evaluate.py / make eval-*.
   seeds: [100, 101, 102, 103, 104, 105, 106, 107, 108, 109,
           110, 111, 112, 113, 114, 115, 116, 117, 118, 119]
   scenario_modes: ["stationary", "seasonal", "trend", "shock", "random"]
+
+  # Small, disjoint selection set used during training to choose checkpoints.
+  # 4 seeds x 5 modes = 20 deterministic episodes per evaluation. Keeping
+  # these seeds separate from the full validation set reduces selection bias.
+  periodic:
+    enabled: true
+    seeds: [200, 201, 202, 203]
+    scenario_modes: ["stationary", "seasonal", "trend", "shock", "random"]
+    default_interval_steps: 250000
+    default_interval_episodes: 2000
 
 techniques:
   # ---- SB3 On-Policy ----

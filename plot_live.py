@@ -91,6 +91,19 @@ def load_train_log(tech_name):
         return None
 
 
+def load_eval_log(tech_name):
+    path = MODELS_DIR / tech_name / "eval_metrics.csv"
+    if not path.exists() or path.stat().st_size < 10:
+        return None
+    try:
+        df = pd.read_csv(path)
+        if len(df) == 0:
+            return None
+        return df
+    except Exception:
+        return None
+
+
 def prepare_plot_series(df):
     """Return (x, y) with NaN inserted at session-boundary gaps.
 
@@ -136,7 +149,7 @@ def prepare_plot_series(df):
 # Plotting
 # ---------------------------------------------------------------------------
 
-def plot_one_axis(ax, tech_name, df, scale="loglog"):
+def plot_one_axis(ax, tech_name, df, eval_df=None, scale="loglog"):
     ax.clear()
 
     use_logx = scale in ("loglog", "logx")
@@ -153,7 +166,27 @@ def plot_one_axis(ax, tech_name, df, scale="loglog"):
         if use_logy:
             y = np.where(y <= 0, np.nan, y)
 
-        ax.plot(x, y, linewidth=0.8)
+        ax.plot(x, y, linewidth=0.8, label="training rolling-100")
+
+        eval_best = None
+        if eval_df is not None and len(eval_df) > 0 and \
+                {"timestep", "mean_cost"}.issubset(eval_df.columns):
+            ex = pd.to_numeric(eval_df["timestep"], errors="coerce").to_numpy()
+            ey = pd.to_numeric(eval_df["mean_cost"], errors="coerce").to_numpy()
+            valid = np.isfinite(ex) & np.isfinite(ey)
+            ex, ey = ex[valid], ey[valid]
+            if use_logx:
+                valid = ex > 0
+                ex, ey = ex[valid], ey[valid]
+            if use_logy:
+                valid = ey > 0
+                ex, ey = ex[valid], ey[valid]
+            if len(ex) > 0:
+                ax.plot(ex, ey, marker="o", markersize=3, linewidth=0.8,
+                        linestyle="--", label="deterministic eval")
+                eval_best = float(np.min(ey))
+                ax.legend(fontsize=7)
+
         if use_logx:
             ax.set_xscale("log")
         if use_logy:
@@ -168,9 +201,11 @@ def plot_one_axis(ax, tech_name, df, scale="loglog"):
         if len(finite_y) > 0:
             current = finite_y[-1]
             best = finite_y.min()
+            eval_note = (f"  eval-best: {_human_format(eval_best)}"
+                         if eval_best is not None else "")
             ax.set_title(f"{tech_name.upper()}\n"
-                         f"current: {_human_format(current)}  "
-                         f"best: {_human_format(best)}")
+                         f"train current: {_human_format(current)}  "
+                         f"train best: {_human_format(best)}{eval_note}")
         else:
             ax.set_title(tech_name.upper())
 
@@ -200,7 +235,8 @@ def plot_techniques(techniques, save=False, scale="loglog"):
         axes = axes[0]
         for i, tech in enumerate(techniques):
             df = load_train_log(tech)
-            plot_one_axis(axes[i], tech, df, scale=scale)
+            eval_df = load_eval_log(tech)
+            plot_one_axis(axes[i], tech, df, eval_df=eval_df, scale=scale)
         plt.suptitle(f"Training Progress ({scale})", y=1.02)
         plt.tight_layout()
         out = PLOTS_DIR / f"training_progress_{scale}.png"
@@ -220,7 +256,8 @@ def plot_techniques(techniques, save=False, scale="loglog"):
         while True:
             for i, tech in enumerate(techniques):
                 df = load_train_log(tech)
-                plot_one_axis(axes[i], tech, df, scale=scale)
+                eval_df = load_eval_log(tech)
+                plot_one_axis(axes[i], tech, df, eval_df=eval_df, scale=scale)
 
             plt.suptitle(
                 f"Training Progress ({scale})  (refreshing every 30s)",

@@ -23,6 +23,14 @@ import pandas as pd
 import yaml
 
 import wandb_utils
+from evaluation_adapters import (
+    a3c_policy_fn,
+    nn_custom_policy_fn,
+    reinforce_policy_fn,
+    sb3_policy_fn,
+    tabular_policy_fn,
+)
+from periodic_evaluation import PeriodicEvaluator
 from run_context import RunContext
 
 PROJECT_ROOT = Path(__file__).parent
@@ -63,7 +71,8 @@ def _make_pipeline_callback(*args, **kwargs):
 
         def __init__(self, model_dir, checkpoint_min=5, steps_offset=0,
                      episodes_offset=0, best_cost=float("inf"),
-                     technique_name="SB3", convergence_state=None, verbose=0):
+                     technique_name="SB3", convergence_state=None,
+                     periodic_evaluator=None, action_type="multi", verbose=0):
             super().__init__(verbose)
             self.model_dir = Path(model_dir)
             self.checkpoint_sec = checkpoint_min * 60
@@ -78,6 +87,8 @@ def _make_pipeline_callback(*args, **kwargs):
                 "first_episode": None,
                 "reason": None,
             }
+            self.periodic_evaluator = periodic_evaluator
+            self.action_type = action_type
 
             self.log_path = self.model_dir / "train_log.csv"
             self.start_wall = time.time()
@@ -124,6 +135,16 @@ def _make_pipeline_callback(*args, **kwargs):
                     wandb_utils.log_episode(
                         self.episode_count, self.total_steps, ep_cost,
                         rolling_avg=roll_avg, best_cost=self.best_cost)
+
+            # --- deterministic fixed-seed evaluation ---
+            if self.periodic_evaluator is not None:
+                self.periodic_evaluator.maybe_evaluate(
+                    progress=self.total_steps,
+                    episode=self.episode_count,
+                    policy_factory=lambda: sb3_policy_fn(
+                        self.model, self.action_type),
+                    save_best_fn=lambda path: self.model.save(str(path)),
+                )
 
             # --- time-based checkpoint ---
             now = time.time()
@@ -186,6 +207,14 @@ def _make_pipeline_callback(*args, **kwargs):
                   f"best={self.best_cost:,.0f}{convergence_note}")
 
         def on_training_end(self):
+            if self.periodic_evaluator is not None:
+                self.periodic_evaluator.evaluate_final(
+                    progress=self.total_steps,
+                    episode=self.episode_count,
+                    policy_factory=lambda: sb3_policy_fn(
+                        self.model, self.action_type),
+                    save_best_fn=lambda path: self.model.save(str(path)),
+                )
             self._check_convergence()
             self._save_checkpoint()
 
@@ -398,6 +427,18 @@ def train_sb3(algo_class, tech_name, config, tc, model_dir, student_config, forc
     print(f"{tech_name}: training {remaining:,} steps "
           f"({steps_done:,} -> {total:,})")
 
+    periodic_eval = PeriodicEvaluator(
+        technique=tc.get("algo", tech_name),
+        config=config,
+        tech_config=tc,
+        student_config=student_config,
+        model_dir=model_dir,
+        progress_unit="steps",
+        start_progress=steps_done,
+        force=force,
+        trainer_start_wall=time.time(),
+    )
+
     cb = _make_pipeline_callback(
         model_dir=model_dir,
         checkpoint_min=config.get("checkpoint_interval_min", 5),
@@ -406,6 +447,8 @@ def train_sb3(algo_class, tech_name, config, tc, model_dir, student_config, forc
         best_cost=best_cost,
         technique_name=tech_name,
         convergence_state=convergence_state,
+        periodic_evaluator=periodic_eval,
+        action_type=tc.get("action_type", "multi"),
     )
 
     model.learn(total_timesteps=remaining, callback=cb)
@@ -518,6 +561,17 @@ def train_reinforce(config, tc, model_dir, student_config, force):
     last_ckpt_wall = start_wall
     recent_costs = []
     total_steps = ep_start * 50  # approximate
+    periodic_eval = PeriodicEvaluator(
+        technique="reinforce",
+        config=config,
+        tech_config=tc,
+        student_config=student_config,
+        model_dir=model_dir,
+        progress_unit="episodes",
+        start_progress=ep_start,
+        force=force,
+        trainer_start_wall=start_wall,
+    )
 
     for ep in range(ep_start + 1, total_episodes + 1):
         obs, _ = env.reset()
@@ -580,6 +634,14 @@ def train_reinforce(config, tc, model_dir, student_config, force):
                 torch.save(policy.state_dict(),
                            str(model_dir / "best_model.pt"))
 
+        periodic_eval.maybe_evaluate(
+            progress=ep,
+            episode=ep,
+            policy_factory=lambda: reinforce_policy_fn(policy),
+            save_best_fn=lambda path: torch.save(
+                policy.state_dict(), str(path.with_suffix(".pt"))),
+        )
+
         # Time-based checkpoint
         now = time.time()
         if now - last_ckpt_wall >= ckpt_sec:
@@ -619,6 +681,14 @@ def train_reinforce(config, tc, model_dir, student_config, force):
             avg = np.mean(recent_costs[-500:]) if len(recent_costs) >= 500 \
                 else np.mean(recent_costs)
             print(f"  Episode {ep:6,} | Avg Cost (last 500): {avg:,.0f}")
+
+    periodic_eval.evaluate_final(
+        progress=total_episodes,
+        episode=total_episodes,
+        policy_factory=lambda: reinforce_policy_fn(policy),
+        save_best_fn=lambda path: torch.save(
+            policy.state_dict(), str(path.with_suffix(".pt"))),
+    )
 
     # Save final
     torch.save(policy.state_dict(), str(model_dir / "final_model.pt"))
@@ -744,6 +814,17 @@ def train_tabular(config, tc, model_dir, student_config, force):
     start_wall = time.time()
     last_ckpt_wall = start_wall
     recent_costs = []
+    periodic_eval = PeriodicEvaluator(
+        technique=update_rule,
+        config=config,
+        tech_config=tc,
+        student_config=student_config,
+        model_dir=model_dir,
+        progress_unit="episodes",
+        start_progress=ep_start,
+        force=force,
+        trainer_start_wall=start_wall,
+    )
 
     for rel_ep, ep_cost in gen:
         abs_ep = ep_start + rel_ep + 1
@@ -763,6 +844,14 @@ def train_tabular(config, tc, model_dir, student_config, force):
             if roll_avg < best_cost:
                 best_cost = roll_avg
                 agent.save(str(model_dir / "best_model.npz"))
+
+        periodic_eval.maybe_evaluate(
+            progress=abs_ep,
+            episode=abs_ep,
+            policy_factory=lambda: tabular_policy_fn(agent, discretizer),
+            save_best_fn=lambda path: agent.save(
+                str(path.with_suffix(".npz"))),
+        )
 
         now = time.time()
         if now - last_ckpt_wall >= ckpt_sec:
@@ -790,6 +879,12 @@ def train_tabular(config, tc, model_dir, student_config, force):
                 else np.mean(recent_costs)
             print(f"  Episode {abs_ep:6,} | Avg Cost: {avg:,.0f}")
 
+    periodic_eval.evaluate_final(
+        progress=total_episodes,
+        episode=total_episodes,
+        policy_factory=lambda: tabular_policy_fn(agent, discretizer),
+        save_best_fn=lambda path: agent.save(str(path.with_suffix(".npz"))),
+    )
     agent.save(str(model_dir / "final_model.npz"))
     _check_convergence_warning(
         log_path=log_path,
@@ -913,6 +1008,17 @@ def train_nn_custom(config, tc, model_dir, student_config, force):
     start_wall = time.time()
     last_ckpt_wall = start_wall
     recent_costs = []
+    periodic_eval = PeriodicEvaluator(
+        technique=f"nn_{update_rule}",
+        config=config,
+        tech_config=tc,
+        student_config=student_config,
+        model_dir=model_dir,
+        progress_unit="episodes",
+        start_progress=ep_start,
+        force=force,
+        trainer_start_wall=start_wall,
+    )
 
     for ep in range(ep_start + 1, total_episodes + 1):
         epsilon = max(eps_end, eps_start - (eps_start - eps_end) * ep / eps_decay)
@@ -934,6 +1040,14 @@ def train_nn_custom(config, tc, model_dir, student_config, force):
             if roll_avg < best_cost:
                 best_cost = roll_avg
                 torch.save(model.state_dict(), str(model_dir / "best_model.pt"))
+
+        periodic_eval.maybe_evaluate(
+            progress=ep,
+            episode=ep,
+            policy_factory=lambda: nn_custom_policy_fn(model),
+            save_best_fn=lambda path: torch.save(
+                model.state_dict(), str(path.with_suffix(".pt"))),
+        )
 
         now = time.time()
         if now - last_ckpt_wall >= ckpt_sec:
@@ -963,6 +1077,13 @@ def train_nn_custom(config, tc, model_dir, student_config, force):
                 else np.mean(recent_costs)
             print(f"  Episode {ep:6,} | Avg Cost: {avg:,.0f}")
 
+    periodic_eval.evaluate_final(
+        progress=total_episodes,
+        episode=total_episodes,
+        policy_factory=lambda: nn_custom_policy_fn(model),
+        save_best_fn=lambda path: torch.save(
+            model.state_dict(), str(path.with_suffix(".pt"))),
+    )
     torch.save(model.state_dict(), str(model_dir / "final_model.pt"))
     _check_convergence_warning(
         log_path=log_path,
@@ -1113,6 +1234,17 @@ def train_a3c(config, tc, model_dir, student_config, force):
 
     start_wall = time.time()
     last_check_wall = start_wall
+    periodic_eval = PeriodicEvaluator(
+        technique="a3c",
+        config=config,
+        tech_config=tc,
+        student_config=student_config,
+        model_dir=model_dir,
+        progress_unit="episodes",
+        start_progress=ep_start,
+        force=force,
+        trainer_start_wall=start_wall,
+    )
     workers = []
     for i in range(n_workers):
         p = mp.Process(target=a3c_worker, args=(
@@ -1132,6 +1264,25 @@ def train_a3c(config, tc, model_dir, student_config, force):
         # Consume episode results continuously so best-model snapshots are not
         # limited to the five-minute checkpoint interval.
         drain_results_nowait()
+
+        with lock:
+            eval_completed_ep = completed_counter.value
+        if periodic_eval.enabled and eval_completed_ep >= periodic_eval.next_progress:
+            eval_state = snapshot_shared_model()
+
+            def _a3c_eval_policy_factory(state=eval_state):
+                eval_model = ActorCritic(hidden=hidden)
+                eval_model.load_state_dict(state)
+                eval_model.eval()
+                return a3c_policy_fn(eval_model)
+
+            periodic_eval.maybe_evaluate(
+                progress=eval_completed_ep,
+                episode=eval_completed_ep,
+                policy_factory=_a3c_eval_policy_factory,
+                save_best_fn=lambda path, state=eval_state: torch.save(
+                    state, str(path.with_suffix(".pt"))),
+            )
 
         now = time.time()
         if now - last_check_wall >= ckpt_sec:
@@ -1212,8 +1363,24 @@ def train_a3c(config, tc, model_dir, student_config, force):
             f"{name}: worker process failure(s): {failed_workers}. "
             f"Recovery model saved to {ckpt_path}")
 
-    # Save final model.
+    # Final deterministic evaluation of the completed shared model.
     final_state = snapshot_shared_model()
+
+    def _a3c_final_policy_factory(state=final_state):
+        eval_model = ActorCritic(hidden=hidden)
+        eval_model.load_state_dict(state)
+        eval_model.eval()
+        return a3c_policy_fn(eval_model)
+
+    periodic_eval.evaluate_final(
+        progress=completed_counter.value,
+        episode=completed_counter.value,
+        policy_factory=_a3c_final_policy_factory,
+        save_best_fn=lambda path, state=final_state: torch.save(
+            state, str(path.with_suffix(".pt"))),
+    )
+
+    # Save final model.
     torch.save(final_state, str(model_dir / "final_model.pt"))
     torch.save(final_state, str(ckpt_path))
 

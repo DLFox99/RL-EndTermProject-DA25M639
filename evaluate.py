@@ -17,7 +17,8 @@ import pandas as pd
 import yaml
 
 from env_wrappers import flatten_observation, DiscreteActionWrapper
-from industrial_inventory_env import IndustrialInventoryEnv, generate_student_config
+from industrial_inventory_env import generate_student_config
+from evaluation_core import run_policy_evaluation
 
 PROJECT_ROOT = Path(__file__).parent
 MODELS_DIR = PROJECT_ROOT / "models"
@@ -30,10 +31,25 @@ def load_config():
         return yaml.safe_load(f)
 
 
-def build_policy_fn(tech_name, tc, model_dir):
+def build_policy_fn(tech_name, tc, model_dir, checkpoint="auto"):
     """Build a policy function that maps observation → [q1, q2, q3]."""
     action_type = tc.get("action_type", "multi")
     category = tc.get("category", "onpolicy")
+
+    def choose_model(ext):
+        choices = {
+            "best_eval": [f"best_eval_model{ext}"],
+            "best_train": [f"best_model{ext}"],
+            "final": [f"final_model{ext}"],
+            "auto": [f"best_eval_model{ext}", f"best_model{ext}",
+                     f"final_model{ext}"],
+        }
+        for name in choices[checkpoint]:
+            path = model_dir / name
+            if path.exists():
+                return path
+        raise FileNotFoundError(
+            f"no {checkpoint} checkpoint found for {tech_name} in {model_dir}")
 
     if category == "tabular":
         from tabular_agent import StateDiscretizer, TabularAgent
@@ -41,9 +57,7 @@ def build_policy_fn(tech_name, tc, model_dir):
         discretizer = StateDiscretizer()
         agent = TabularAgent(discretizer.n_states)
 
-        model_path = model_dir / "best_model.npz"
-        if not model_path.exists():
-            model_path = model_dir / "final_model.npz"
+        model_path = choose_model(".npz")
         agent.load(str(model_path))
 
         def fn(obs):
@@ -59,9 +73,7 @@ def build_policy_fn(tech_name, tc, model_dir):
         else:
             from reinforce_agent import ReinforcePolicy as NetClass
 
-        model_path = model_dir / "best_model.pt"
-        if not model_path.exists():
-            model_path = model_dir / "final_model.pt"
+        model_path = choose_model(".pt")
 
         net = NetClass(hidden=tc.get("hidden", 128))
         net.load_state_dict(
@@ -82,9 +94,7 @@ def build_policy_fn(tech_name, tc, model_dir):
         import torch
         from nn_agent import QNetworkFactored
 
-        model_path = model_dir / "best_model.pt"
-        if not model_path.exists():
-            model_path = model_dir / "final_model.pt"
+        model_path = choose_model(".pt")
 
         net = QNetworkFactored(hidden=tc.get("hidden", 128))
         net.load_state_dict(
@@ -109,11 +119,8 @@ def build_policy_fn(tech_name, tc, model_dir):
             import stable_baselines3
             loader_cls = getattr(stable_baselines3, algo_name)
 
-        # Prefer best_model, fall back to final
-        model_path = model_dir / "best_model"
-        if not (model_dir / "best_model.zip").exists():
-            model_path = model_dir / "final_model"
-
+        model_path = choose_model(".zip")
+        # SB3 load accepts a .zip path directly.
         model = loader_cls.load(str(model_path))
 
         if action_type == "discrete":
@@ -129,7 +136,7 @@ def build_policy_fn(tech_name, tc, model_dir):
         return fn
 
 
-def evaluate_technique(tech_name, tc, config, student_config, force=False):
+def evaluate_technique(tech_name, tc, config, student_config, force=False, checkpoint="auto"):
     """Run policy over all seeds × scenario modes, save CSV."""
     RESULTS_DIR.mkdir(exist_ok=True)
     csv_path = RESULTS_DIR / f"{tech_name}_eval.csv"
@@ -144,45 +151,25 @@ def evaluate_technique(tech_name, tc, config, student_config, force=False):
     has_model = any(
         (model_dir / f).exists()
         for f in ["final_model.zip", "final_model.pt", "final_model.npz",
-                   "best_model.zip", "best_model.pt", "best_model.npz"]
+                   "best_model.zip", "best_model.pt", "best_model.npz",
+                   "best_eval_model.zip", "best_eval_model.pt",
+                   "best_eval_model.npz"]
     )
     if not has_model:
         print(f"{tech_name}: no model found in {model_dir}. Train first.")
         return None
 
-    policy_fn = build_policy_fn(tech_name, tc, model_dir)
+    policy_fn = build_policy_fn(tech_name, tc, model_dir, checkpoint=checkpoint)
 
     seeds = config["evaluation"]["seeds"]
     modes = config["evaluation"]["scenario_modes"]
 
-    records = []
-    for mode in modes:
-        for seed in seeds:
-            env = IndustrialInventoryEnv(
-                student_config, scenario_mode=mode, domain_randomization=True)
-            obs, info = env.reset(seed=seed)
-
-            done = False
-            while not done:
-                quantities = policy_fn(obs)
-                # Convert quantities → action indices
-                action_indices = np.array(
-                    [q // 10 for q in quantities], dtype=np.int64)
-                obs, reward, terminated, truncated, step_info = env.step(
-                    action_indices)
-                done = terminated or truncated
-
-            costs = step_info["costs"]
-            records.append({
-                "technique": tech_name,
-                "scenario_mode": mode,
-                "seed": seed,
-                "total_cost": costs["episode_total"],
-                "holding_cost": costs["holding"],
-                "stockout_cost": costs["stockout"],
-                "ordering_cost": costs["ordering"],
-                "discard_cost": costs["discarding"],
-            })
+    result = run_policy_evaluation(
+        policy_fn, student_config, seeds=seeds, scenario_modes=modes)
+    records = [
+        {"technique": tech_name, **record}
+        for record in result["records"]
+    ]
 
     df = pd.DataFrame(records)
     df.to_csv(csv_path, index=False)
@@ -244,13 +231,19 @@ def main():
     parser = argparse.ArgumentParser(description="Evaluate RL policies")
     parser.add_argument("technique", choices=all_techniques + ["all"])
     parser.add_argument("--force", action="store_true")
+    parser.add_argument(
+        "--checkpoint",
+        choices=["auto", "best_eval", "best_train", "final"],
+        default="auto",
+        help="Which checkpoint to evaluate; auto prefers best_eval, then best_train, then final",
+    )
     args = parser.parse_args()
 
     techniques = all_techniques if args.technique == "all" else [args.technique]
 
     for tech in techniques:
         tc = config["techniques"][tech]
-        evaluate_technique(tech, tc, config, student_config, args.force)
+        evaluate_technique(tech, tc, config, student_config, args.force, args.checkpoint)
 
     if args.technique == "all":
         generate_comparison(config)
