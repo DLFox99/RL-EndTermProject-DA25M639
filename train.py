@@ -47,144 +47,148 @@ def get_student_config(config):
 # SB3 Callback — checkpointing + episode logging + best model tracking
 # ---------------------------------------------------------------------------
 
-from stable_baselines3.common.callbacks import BaseCallback
 
 
-class PipelineCallback(BaseCallback):
-    """Checkpoint, log episodes, track best model, and report convergence.
+def _make_pipeline_callback(*args, **kwargs):
+    # Import SB3 only when an SB3 algorithm actually needs the callback.
+    from stable_baselines3.common.callbacks import BaseCallback
 
-    Convergence is diagnostic only: it never stops training.  The configured
-    timestep budget remains authoritative.
-    """
+    class PipelineCallback(BaseCallback):
+        """Checkpoint, log episodes, track best model, and report convergence.
 
-    def __init__(self, model_dir, checkpoint_min=5, steps_offset=0,
-                 episodes_offset=0, best_cost=float("inf"),
-                 technique_name="SB3", convergence_state=None, verbose=0):
-        super().__init__(verbose)
-        self.model_dir = Path(model_dir)
-        self.checkpoint_sec = checkpoint_min * 60
-        self.steps_offset = steps_offset
-        self.episode_count = episodes_offset
-        self.best_cost = best_cost
-        self.technique_name = technique_name
-        self.recent_costs = []
-        self.convergence_state = convergence_state or {
-            "detected": False,
-            "first_step": None,
-            "first_episode": None,
-            "reason": None,
-        }
+        Convergence is diagnostic only: it never stops training.  The configured
+        timestep budget remains authoritative.
+        """
 
-        self.log_path = self.model_dir / "train_log.csv"
-        self.start_wall = time.time()
-        self.last_ckpt_wall = time.time()
+        def __init__(self, model_dir, checkpoint_min=5, steps_offset=0,
+                     episodes_offset=0, best_cost=float("inf"),
+                     technique_name="SB3", convergence_state=None, verbose=0):
+            super().__init__(verbose)
+            self.model_dir = Path(model_dir)
+            self.checkpoint_sec = checkpoint_min * 60
+            self.steps_offset = steps_offset
+            self.episode_count = episodes_offset
+            self.best_cost = best_cost
+            self.technique_name = technique_name
+            self.recent_costs = []
+            self.convergence_state = convergence_state or {
+                "detected": False,
+                "first_step": None,
+                "first_episode": None,
+                "reason": None,
+            }
 
-        # Ensure CSV header exists
-        if not self.log_path.exists() or self.log_path.stat().st_size == 0:
-            with open(self.log_path, "w") as f:
-                f.write("episode,timestep,episode_cost,wall_time_s,timestamp\n")
+            self.log_path = self.model_dir / "train_log.csv"
+            self.start_wall = time.time()
+            self.last_ckpt_wall = time.time()
 
-    @property
-    def total_steps(self):
-        return self.steps_offset + self.num_timesteps
+            # Ensure CSV header exists
+            if not self.log_path.exists() or self.log_path.stat().st_size == 0:
+                with open(self.log_path, "w") as f:
+                    f.write("episode,timestep,episode_cost,wall_time_s,timestamp\n")
 
-    @property
-    def converged(self):
-        """Whether convergence has ever been detected during this run."""
-        return bool(self.convergence_state["detected"])
+        @property
+        def total_steps(self):
+            return self.steps_offset + self.num_timesteps
 
-    def _on_step(self) -> bool:
-        # --- episode logging ---
-        for info in self.locals.get("infos", []):
-            if "episode" in info:
-                ep_return = info["episode"]["r"]
-                ep_cost = -ep_return * 100
-                self.episode_count += 1
-                self.recent_costs.append(ep_cost)
+        @property
+        def converged(self):
+            """Whether convergence has ever been detected during this run."""
+            return bool(self.convergence_state["detected"])
 
-                with open(self.log_path, "a") as f:
-                    f.write(f"{self.episode_count},{self.total_steps},"
-                            f"{ep_cost:.2f},{time.time()-self.start_wall:.1f},"
-                            f"{datetime.now().isoformat()}\n")
+        def _on_step(self) -> bool:
+            # --- episode logging ---
+            for info in self.locals.get("infos", []):
+                if "episode" in info:
+                    ep_return = info["episode"]["r"]
+                    ep_cost = -ep_return * 100
+                    self.episode_count += 1
+                    self.recent_costs.append(ep_cost)
 
-                # --- best model tracking (rolling 100) ---
-                if len(self.recent_costs) >= 100:
-                    roll_avg = np.mean(self.recent_costs[-100:])
-                    if roll_avg < self.best_cost:
-                        self.best_cost = roll_avg
-                        self.model.save(str(self.model_dir / "best_model"))
+                    with open(self.log_path, "a") as f:
+                        f.write(f"{self.episode_count},{self.total_steps},"
+                                f"{ep_cost:.2f},{time.time()-self.start_wall:.1f},"
+                                f"{datetime.now().isoformat()}\n")
 
-                # --- wandb logging ---
-                roll_avg = np.mean(self.recent_costs[-100:]) \
-                    if len(self.recent_costs) >= 100 else np.mean(self.recent_costs)
-                wandb_utils.log_episode(
-                    self.episode_count, self.total_steps, ep_cost,
-                    rolling_avg=roll_avg, best_cost=self.best_cost)
+                    # --- best model tracking (rolling 100) ---
+                    if len(self.recent_costs) >= 100:
+                        roll_avg = np.mean(self.recent_costs[-100:])
+                        if roll_avg < self.best_cost:
+                            self.best_cost = roll_avg
+                            self.model.save(str(self.model_dir / "best_model"))
 
-        # --- time-based checkpoint ---
-        now = time.time()
-        if now - self.last_ckpt_wall >= self.checkpoint_sec:
+                    # --- wandb logging ---
+                    roll_avg = np.mean(self.recent_costs[-100:]) \
+                        if len(self.recent_costs) >= 100 else np.mean(self.recent_costs)
+                    wandb_utils.log_episode(
+                        self.episode_count, self.total_steps, ep_cost,
+                        rolling_avg=roll_avg, best_cost=self.best_cost)
+
+            # --- time-based checkpoint ---
+            now = time.time()
+            if now - self.last_ckpt_wall >= self.checkpoint_sec:
+                self._check_convergence()
+                self._save_checkpoint()
+                self.last_ckpt_wall = now
+
+            # Convergence is advisory only.  Returning True keeps SB3 training
+            # until the requested timestep budget is exhausted.
+            return True
+
+        def _check_convergence(self):
+            _check_convergence_warning(
+                log_path=self.log_path,
+                label=self.technique_name,
+                step=self.total_steps,
+                episode=self.episode_count,
+                state=self.convergence_state,
+            )
+
+        def _save_checkpoint(self):
+            ckpt = str(self.model_dir / "checkpoints" / "checkpoint")
+            self.model.save(ckpt)
+
+            # Replay buffer for off-policy
+            if hasattr(self.model, "replay_buffer") and self.model.replay_buffer is not None:
+                buf_path = str(self.model_dir / "checkpoints" / "replay_buffer")
+                self.model.save_replay_buffer(buf_path)
+
+            self._write_metadata()
+            self._print_status()
+            wandb_utils.log_checkpoint(
+                self.total_steps, self.episode_count,
+                self.best_cost, self.converged)
+
+        def _write_metadata(self):
+            meta = {
+                "steps_completed": self.total_steps,
+                "episodes_completed": self.episode_count,
+                "wall_time_s": time.time() - self.start_wall,
+                "best_rolling_cost": self.best_cost
+                    if self.best_cost < float("inf") else None,
+                "convergence_detected": self.convergence_state["detected"],
+                "convergence_first_step": self.convergence_state["first_step"],
+                "convergence_first_episode": self.convergence_state["first_episode"],
+                "convergence_reason": self.convergence_state["reason"],
+                "last_checkpoint": datetime.now().isoformat(),
+            }
+            with open(self.model_dir / "training_metadata.json", "w") as f:
+                json.dump(meta, f, indent=2)
+
+        def _print_status(self):
+            recent = self.recent_costs[-100:] if self.recent_costs else []
+            avg = np.mean(recent) if recent else 0
+            convergence_note = "  convergence=detected" if self.converged else ""
+            print(f"  [checkpoint] steps={self.total_steps:,}  "
+                  f"episodes={self.episode_count:,}  "
+                  f"recent_avg_cost={avg:,.0f}  "
+                  f"best={self.best_cost:,.0f}{convergence_note}")
+
+        def on_training_end(self):
             self._check_convergence()
             self._save_checkpoint()
-            self.last_ckpt_wall = now
 
-        # Convergence is advisory only.  Returning True keeps SB3 training
-        # until the requested timestep budget is exhausted.
-        return True
-
-    def _check_convergence(self):
-        _check_convergence_warning(
-            log_path=self.log_path,
-            label=self.technique_name,
-            step=self.total_steps,
-            episode=self.episode_count,
-            state=self.convergence_state,
-        )
-
-    def _save_checkpoint(self):
-        ckpt = str(self.model_dir / "checkpoints" / "checkpoint")
-        self.model.save(ckpt)
-
-        # Replay buffer for off-policy
-        if hasattr(self.model, "replay_buffer") and self.model.replay_buffer is not None:
-            buf_path = str(self.model_dir / "checkpoints" / "replay_buffer")
-            self.model.save_replay_buffer(buf_path)
-
-        self._write_metadata()
-        self._print_status()
-        wandb_utils.log_checkpoint(
-            self.total_steps, self.episode_count,
-            self.best_cost, self.converged)
-
-    def _write_metadata(self):
-        meta = {
-            "steps_completed": self.total_steps,
-            "episodes_completed": self.episode_count,
-            "wall_time_s": time.time() - self.start_wall,
-            "best_rolling_cost": self.best_cost
-                if self.best_cost < float("inf") else None,
-            "convergence_detected": self.convergence_state["detected"],
-            "convergence_first_step": self.convergence_state["first_step"],
-            "convergence_first_episode": self.convergence_state["first_episode"],
-            "convergence_reason": self.convergence_state["reason"],
-            "last_checkpoint": datetime.now().isoformat(),
-        }
-        with open(self.model_dir / "training_metadata.json", "w") as f:
-            json.dump(meta, f, indent=2)
-
-    def _print_status(self):
-        recent = self.recent_costs[-100:] if self.recent_costs else []
-        avg = np.mean(recent) if recent else 0
-        convergence_note = "  convergence=detected" if self.converged else ""
-        print(f"  [checkpoint] steps={self.total_steps:,}  "
-              f"episodes={self.episode_count:,}  "
-              f"recent_avg_cost={avg:,.0f}  "
-              f"best={self.best_cost:,.0f}{convergence_note}")
-
-    def on_training_end(self):
-        self._check_convergence()
-        self._save_checkpoint()
-
+    return PipelineCallback(*args, **kwargs)
 
 # ---------------------------------------------------------------------------
 # Environment factories
@@ -393,7 +397,7 @@ def train_sb3(algo_class, tech_name, config, tc, model_dir, student_config, forc
     print(f"{tech_name}: training {remaining:,} steps "
           f"({steps_done:,} → {total:,})")
 
-    cb = PipelineCallback(
+    cb = _make_pipeline_callback(
         model_dir=model_dir,
         checkpoint_min=config.get("checkpoint_interval_min", 5),
         steps_offset=steps_done,
