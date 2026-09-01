@@ -23,6 +23,7 @@ import pandas as pd
 import yaml
 
 import wandb_utils
+from run_context import RunContext
 
 PROJECT_ROOT = Path(__file__).parent
 MODELS_DIR = PROJECT_ROOT / "models"
@@ -395,7 +396,7 @@ def train_sb3(algo_class, tech_name, config, tc, model_dir, student_config, forc
         return
 
     print(f"{tech_name}: training {remaining:,} steps "
-          f"({steps_done:,} → {total:,})")
+          f"({steps_done:,} -> {total:,})")
 
     cb = _make_pipeline_callback(
         model_dir=model_dir,
@@ -503,7 +504,7 @@ def train_reinforce(config, tc, model_dir, student_config, force):
         print("REINFORCE: fully trained.")
         return
 
-    print(f"REINFORCE: training episodes {ep_start:,} → {total_episodes:,}")
+    print(f"REINFORCE: training episodes {ep_start:,} -> {total_episodes:,}")
 
     env = IndustrialInventoryEnv(student_config, scenario_mode="random",
                                   domain_randomization=True)
@@ -707,7 +708,7 @@ def train_tabular(config, tc, model_dir, student_config, force):
         print(f"{name}: fully trained.")
         return
 
-    print(f"{name}: training episodes {ep_start:,} → {total_episodes:,}")
+    print(f"{name}: training episodes {ep_start:,} -> {total_episodes:,}")
 
     env = IndustrialInventoryEnv(student_config, scenario_mode="random",
                                   domain_randomization=True)
@@ -890,7 +891,7 @@ def train_nn_custom(config, tc, model_dir, student_config, force):
         print(f"{name}: fully trained.")
         return
 
-    print(f"{name}: training episodes {ep_start:,} → {total_episodes:,} "
+    print(f"{name}: training episodes {ep_start:,} -> {total_episodes:,} "
           f"on {device}")
 
     env = IndustrialInventoryEnv(student_config, scenario_mode="random",
@@ -1283,6 +1284,9 @@ def main():
                         help="Technique to train, or 'all'")
     parser.add_argument("--force", action="store_true",
                         help="Delete existing model and retrain from scratch")
+    parser.add_argument(
+        "--run-name", default=None,
+        help="Optional label included in the immutable run record")
     budget_group = parser.add_mutually_exclusive_group()
     budget_group.add_argument(
         "--timesteps", type=int, default=None,
@@ -1323,7 +1327,25 @@ def main():
         print(f"  {tc.get('portal_name', tech)}")
         print(f"{'='*60}")
 
-        TRAINERS[tech](config, tc, model_dir, student_config, args.force)
+        try:
+            with RunContext(
+                    technique=tech,
+                    tech_config=tc,
+                    full_config=config,
+                    model_dir=model_dir,
+                    force=args.force,
+                    run_name=args.run_name) as run_context:
+                TRAINERS[tech](config, tc, model_dir, student_config, args.force)
+        except KeyboardInterrupt:
+            # RunContext has already finalized the partial experiment as
+            # interrupted. Exit quietly with the conventional Ctrl-C status.
+            print("\nTraining interrupted by user.")
+            raise SystemExit(130)
+        finally:
+            # Individual trainers already finish W&B on normal completion. This
+            # second call is an intentional no-op then, and guarantees cleanup
+            # if a trainer exits via exception or KeyboardInterrupt.
+            wandb_utils.finish()
 
 
 if __name__ == "__main__":
