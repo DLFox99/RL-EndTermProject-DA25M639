@@ -1,0 +1,17 @@
+name: ppo-stage1-lr-entropy
+technique: ppo
+force: true
+wandb_mode: disabled
+max_parallel: 1
+
+budget:
+  timesteps: 1000000
+
+base_overrides:
+  evaluation.periodic.default_interval_steps: 100000
+
+grid:
+  learning_rate: [0.00015, 0.0003, 0.0006]
+  ent_coef: [0.0, 0.005, 0.01]
+
+repeats: 1
