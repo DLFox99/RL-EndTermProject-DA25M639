@@ -31,6 +31,9 @@ from evaluation_adapters import (
     tabular_policy_fn,
 )
 from periodic_evaluation import PeriodicEvaluator
+from diagnostics import DiagnosticLogger
+from config_overrides import apply_overrides
+from schedules import configured_schedule, set_optimizer_lr, sb3_progress_schedule
 from run_context import RunContext
 
 PROJECT_ROOT = Path(__file__).parent
@@ -72,7 +75,11 @@ def _make_pipeline_callback(*args, **kwargs):
         def __init__(self, model_dir, checkpoint_min=5, steps_offset=0,
                      episodes_offset=0, best_cost=float("inf"),
                      technique_name="SB3", convergence_state=None,
-                     periodic_evaluator=None, action_type="multi", verbose=0):
+                     periodic_evaluator=None, action_type="multi",
+                     diagnostic_logger=None, diagnostic_technique=None,
+                     diagnostic_interval_steps=10000,
+                     q_probe_interval_steps=50000,
+                     q_probe_batch_size=128, verbose=0):
             super().__init__(verbose)
             self.model_dir = Path(model_dir)
             self.checkpoint_sec = checkpoint_min * 60
@@ -89,6 +96,16 @@ def _make_pipeline_callback(*args, **kwargs):
             }
             self.periodic_evaluator = periodic_evaluator
             self.action_type = action_type
+            self.diagnostic_logger = diagnostic_logger
+            self.diagnostic_technique = diagnostic_technique
+            self.diagnostic_interval_steps = max(
+                int(diagnostic_interval_steps), 1)
+            self.q_probe_interval_steps = max(
+                int(q_probe_interval_steps), 1)
+            self.q_probe_batch_size = max(int(q_probe_batch_size), 1)
+            self._last_diag_step = int(steps_offset)
+            self._last_q_probe_step = int(steps_offset)
+            self._last_q_probe = {}
 
             self.log_path = self.model_dir / "train_log.csv"
             self.start_wall = time.time()
@@ -146,6 +163,9 @@ def _make_pipeline_callback(*args, **kwargs):
                     save_best_fn=lambda path: self.model.save(str(path)),
                 )
 
+            # --- algorithm-specific diagnostics ---
+            self._maybe_log_diagnostics()
+
             # --- time-based checkpoint ---
             now = time.time()
             if now - self.last_ckpt_wall >= self.checkpoint_sec:
@@ -156,6 +176,144 @@ def _make_pipeline_callback(*args, **kwargs):
             # Convergence is advisory only.  Returning True keeps SB3 training
             # until the requested timestep budget is exhausted.
             return True
+
+        def _logger_values(self):
+            logger = getattr(self.model, "logger", None)
+            values = getattr(logger, "name_to_value", None)
+            return values if isinstance(values, dict) else {}
+
+        def _probe_dqn_values(self):
+            """Small no-grad replay probe; never changes optimizer/model state."""
+            if self.diagnostic_technique not in {"dqn", "ddqn"}:
+                return {}
+            replay = getattr(self.model, "replay_buffer", None)
+            if replay is None:
+                return {}
+
+            try:
+                size = int(replay.size())
+            except Exception:
+                size = 0
+            capacity = int(getattr(replay, "buffer_size", 0) or 0)
+            stats = {
+                "replay_size": size,
+                "replay_fraction": (
+                    size / float(capacity) if capacity > 0 else float("nan")),
+            }
+            if size <= 0:
+                return stats
+
+            if self.total_steps - self._last_q_probe_step < \
+                    self.q_probe_interval_steps and self._last_q_probe:
+                return {**stats, **self._last_q_probe}
+
+            try:
+                import torch
+
+                sample_n = min(self.q_probe_batch_size, size)
+                batch = replay.sample(
+                    sample_n,
+                    env=getattr(self.model, "_vec_normalize_env", None),
+                )
+                with torch.no_grad():
+                    q = self.model.q_net(batch.observations)
+                    target_next = self.model.q_net_target(
+                        batch.next_observations)
+                    if self.diagnostic_technique == "ddqn":
+                        online_next = self.model.q_net(
+                            batch.next_observations)
+                        next_actions = online_next.argmax(
+                            dim=1, keepdim=True)
+                        next_q = target_next.gather(
+                            1, next_actions).reshape(-1)
+                    else:
+                        next_q = target_next.max(dim=1).values.reshape(-1)
+
+                    rewards = batch.rewards.reshape(-1)
+                    dones = batch.dones.reshape(-1)
+                    td_target = (
+                        rewards
+                        + float(getattr(self.model, "gamma", 0.99))
+                        * (1.0 - dones)
+                        * next_q
+                    )
+                    q_flat = q.reshape(-1)
+                    probe = {
+                        "q_mean": float(q_flat.mean().item()),
+                        "q_std": float(q_flat.std(unbiased=False).item()),
+                        "q_min": float(q_flat.min().item()),
+                        "q_max": float(q_flat.max().item()),
+                        "target_q_mean": float(td_target.mean().item()),
+                        "target_q_std": float(
+                            td_target.std(unbiased=False).item()),
+                    }
+                self._last_q_probe = probe
+                self._last_q_probe_step = self.total_steps
+                return {**stats, **probe}
+            except Exception:
+                # Diagnostics must never make training fail.
+                return {**stats, **self._last_q_probe}
+
+        def _maybe_log_diagnostics(self, force=False):
+            if self.diagnostic_logger is None:
+                return
+            if not force and (
+                    self.total_steps - self._last_diag_step
+                    < self.diagnostic_interval_steps):
+                return
+
+            values = self._logger_values()
+            metrics = {}
+            if self.diagnostic_technique == "ppo":
+                mapping = {
+                    "policy_gradient_loss": "train/policy_gradient_loss",
+                    "value_loss": "train/value_loss",
+                    "entropy_loss": "train/entropy_loss",
+                    "approx_kl": "train/approx_kl",
+                    "clip_fraction": "train/clip_fraction",
+                    "explained_variance": "train/explained_variance",
+                    "learning_rate": "train/learning_rate",
+                }
+            elif self.diagnostic_technique == "a2c":
+                mapping = {
+                    "policy_loss": "train/policy_loss",
+                    "value_loss": "train/value_loss",
+                    "entropy_loss": "train/entropy_loss",
+                    "explained_variance": "train/explained_variance",
+                    "learning_rate": "train/learning_rate",
+                }
+            else:
+                mapping = {
+                    "loss": "train/loss",
+                    "learning_rate": "train/learning_rate",
+                }
+
+            for out_key, logger_key in mapping.items():
+                value = values.get(logger_key)
+                if value is not None:
+                    try:
+                        metrics[out_key] = float(value)
+                    except (TypeError, ValueError):
+                        pass
+
+            n_updates = getattr(self.model, "_n_updates", None)
+            if n_updates is not None:
+                metrics["n_updates"] = int(n_updates)
+
+            if self.diagnostic_technique in {"dqn", "ddqn"}:
+                exploration = getattr(
+                    self.model, "exploration_rate", None)
+                if exploration is not None:
+                    metrics["exploration_rate"] = float(exploration)
+                metrics.update(self._probe_dqn_values())
+
+            self.diagnostic_logger.log(
+                metrics,
+                episode=self.episode_count,
+                timestep=self.total_steps,
+                wall_time_s=time.time() - self.start_wall,
+            )
+            self._last_diag_step = self.total_steps
 
         def _check_convergence(self):
             _check_convergence_warning(
@@ -215,6 +373,7 @@ def _make_pipeline_callback(*args, **kwargs):
                         self.model, self.action_type),
                     save_best_fn=lambda path: self.model.save(str(path)),
                 )
+            self._maybe_log_diagnostics(force=True)
             self._check_convergence()
             self._save_checkpoint()
 
@@ -303,6 +462,8 @@ def train_sb3(algo_class, tech_name, config, tc, model_dir, student_config, forc
     total = tc["total_timesteps"]
     is_discrete = tc.get("action_type") == "discrete"
     is_offpolicy = tc.get("category") == "offpolicy"
+    lr_schedule = configured_schedule(tc, "learning_rate")
+    epsilon_schedule = configured_schedule(tc, "epsilon") if is_offpolicy else None
 
     # --- wandb init ---
     wandb_utils.init(tech_name, config, tc)
@@ -378,7 +539,10 @@ def train_sb3(algo_class, tech_name, config, tc, model_dir, student_config, forc
 
         # Build kwargs from config
         kwargs = dict(
-            learning_rate=tc["learning_rate"],
+            learning_rate=(
+                sb3_progress_schedule(lr_schedule, total)
+                if lr_schedule is not None else tc["learning_rate"]
+            ),
             gamma=tc.get("gamma", 0.99),
             verbose=1,
             policy_kwargs=dict(net_arch=tc["net_arch"]),
@@ -415,6 +579,15 @@ def train_sb3(algo_class, tech_name, config, tc, model_dir, student_config, forc
 
         model = algo_class("MlpPolicy", vec_env, **kwargs)
 
+    # Optional Phase-5 schedules.  Defaults are untouched when no schedule is
+    # configured.  Re-applying here also lets a resumed sweep deliberately
+    # change the remaining schedule.
+    if lr_schedule is not None:
+        model.lr_schedule = sb3_progress_schedule(lr_schedule, total)
+    if is_offpolicy and epsilon_schedule is not None:
+        model.exploration_schedule = sb3_progress_schedule(
+            epsilon_schedule, total)
+
     # --- save hyperparams ---
     with open(model_dir / "hyperparams_used.yaml", "w") as f:
         yaml.dump(tc, f, default_flow_style=False)
@@ -439,6 +612,21 @@ def train_sb3(algo_class, tech_name, config, tc, model_dir, student_config, forc
         trainer_start_wall=time.time(),
     )
 
+    diag_cfg = config.get("diagnostics", {})
+    diag_key = {
+        "PPO": "ppo",
+        "A2C": "a2c",
+        "DQN": "dqn",
+        "DoubleDQN": "ddqn",
+    }.get(tc.get("algo"), str(tc.get("algo", tech_name)).lower())
+    diagnostic_logger = DiagnosticLogger(
+        model_dir,
+        diag_key,
+        enabled=diag_cfg.get("enabled", True),
+        force=force,
+        start_wall=periodic_eval.trainer_start_wall,
+    )
+
     cb = _make_pipeline_callback(
         model_dir=model_dir,
         checkpoint_min=config.get("checkpoint_interval_min", 5),
@@ -449,6 +637,14 @@ def train_sb3(algo_class, tech_name, config, tc, model_dir, student_config, forc
         convergence_state=convergence_state,
         periodic_evaluator=periodic_eval,
         action_type=tc.get("action_type", "multi"),
+        diagnostic_logger=diagnostic_logger,
+        diagnostic_technique=diag_key,
+        diagnostic_interval_steps=diag_cfg.get(
+            "sb3_interval_steps", 10000),
+        q_probe_interval_steps=diag_cfg.get(
+            "sb3_q_probe_interval_steps", 50000),
+        q_probe_batch_size=diag_cfg.get(
+            "sb3_q_probe_batch_size", 128),
     )
 
     model.learn(total_timesteps=remaining, callback=cb)
@@ -507,6 +703,7 @@ def train_reinforce(config, tc, model_dir, student_config, force):
 
     policy = ReinforcePolicy(hidden=hidden)
     optimizer = torch.optim.Adam(policy.parameters(), lr=lr)
+    lr_schedule = configured_schedule(tc, "learning_rate")
 
     if not force and ckpt_path.exists():
         print("REINFORCE: resuming from checkpoint (full state)")
@@ -572,10 +769,18 @@ def train_reinforce(config, tc, model_dir, student_config, force):
         force=force,
         trainer_start_wall=start_wall,
     )
+    diag_cfg = config.get("diagnostics", {})
+    diagnostic_logger = DiagnosticLogger(
+        model_dir, "reinforce",
+        enabled=diag_cfg.get("enabled", True),
+        force=force, start_wall=start_wall)
 
     for ep in range(ep_start + 1, total_episodes + 1):
+        if lr_schedule is not None:
+            set_optimizer_lr(optimizer, lr_schedule.value(ep))
         obs, _ = env.reset()
         saved_log_probs = []
+        entropy_samples = []
         rewards = []
         done = False
 
@@ -587,6 +792,10 @@ def train_reinforce(config, tc, model_dir, student_config, force):
 
             next_obs, reward, terminated, truncated, info = env.step(action_indices)
             saved_log_probs.append(log_prob.squeeze(0))
+            # Monte-Carlo entropy estimate from the sampled action's
+            # negative log-probability. This reuses the policy sample already
+            # required for REINFORCE and adds no extra forward pass.
+            entropy_samples.append(float(-log_prob.detach().mean().item()))
             rewards.append(reward)
             obs = next_obs
             done = terminated or truncated
@@ -612,8 +821,22 @@ def train_reinforce(config, tc, model_dir, student_config, force):
 
         optimizer.zero_grad()
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(policy.parameters(), max_norm=max_grad_norm)
+        grad_norm = torch.nn.utils.clip_grad_norm_(
+            policy.parameters(), max_norm=max_grad_norm)
         optimizer.step()
+
+        diagnostic_logger.log(
+            {
+                "policy_loss": float(loss.detach().item()),
+                "baseline": float(baseline),
+                "advantage_mean": float(advantages.detach().mean().item()),
+                "advantage_std": float(advantages.detach().std(unbiased=False).item()),
+                "entropy": float(np.mean(entropy_samples)) if entropy_samples else float("nan"),
+                "grad_norm": float(grad_norm),
+            },
+            episode=ep, timestep=total_steps,
+            wall_time_s=time.time() - start_wall,
+        )
 
         # Log
         recent_costs.append(episode_cost)
@@ -793,6 +1016,17 @@ def train_tabular(config, tc, model_dir, student_config, force):
     with open(model_dir / "discretizer_config.json", "w") as f:
         _json.dump(discretizer.config_dict(), f)
 
+    diag_cfg = config.get("diagnostics", {})
+    diag_key = {
+        "qlearning": "tabular_qlearning",
+        "sarsa": "tabular_sarsa",
+        "td_lambda": "td_lambda",
+    }[update_rule]
+    diagnostic_logger = DiagnosticLogger(
+        model_dir, diag_key, enabled=diag_cfg.get("enabled", True),
+        force=force)
+    epsilon_schedule = configured_schedule(tc, "epsilon")
+
     kwargs = dict(
         env=env, discretizer=discretizer, agent=agent,
         num_episodes=remaining,
@@ -801,6 +1035,8 @@ def train_tabular(config, tc, model_dir, student_config, force):
         epsilon_end=tc.get("epsilon_end", 0.05),
         epsilon_decay_episodes=tc.get("epsilon_decay_episodes"),
         episode_offset=ep_start,
+        return_diagnostics=diagnostic_logger.enabled,
+        epsilon_schedule=(epsilon_schedule.value if epsilon_schedule else None),
     )
 
     if update_rule == "qlearning":
@@ -812,6 +1048,7 @@ def train_tabular(config, tc, model_dir, student_config, force):
         gen = train_td_lambda(**kwargs)
 
     start_wall = time.time()
+    diagnostic_logger.start_wall = start_wall
     last_ckpt_wall = start_wall
     recent_costs = []
     periodic_eval = PeriodicEvaluator(
@@ -826,9 +1063,17 @@ def train_tabular(config, tc, model_dir, student_config, force):
         trainer_start_wall=start_wall,
     )
 
-    for rel_ep, ep_cost in gen:
+    for item in gen:
+        if diagnostic_logger.enabled:
+            rel_ep, ep_cost, diagnostics = item
+        else:
+            rel_ep, ep_cost = item
+            diagnostics = {}
         abs_ep = ep_start + rel_ep + 1
         recent_costs.append(ep_cost)
+        diagnostic_logger.log(
+            diagnostics, episode=abs_ep, timestep=abs_ep * 50,
+            wall_time_s=time.time() - start_wall)
 
         with open(log_path, "a") as f:
             f.write(f"{abs_ep},{abs_ep*50},{ep_cost:.2f},"
@@ -944,6 +1189,8 @@ def train_nn_custom(config, tc, model_dir, student_config, force):
 
     model = QNetworkFactored(hidden=hidden).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    epsilon_schedule = configured_schedule(tc, "epsilon")
+    lr_schedule = configured_schedule(tc, "learning_rate")
 
     ckpt_path = model_dir / "checkpoints" / "checkpoint.pt"
     final_path = model_dir / "final_model.pt"
@@ -1019,12 +1266,34 @@ def train_nn_custom(config, tc, model_dir, student_config, force):
         force=force,
         trainer_start_wall=start_wall,
     )
+    diag_cfg = config.get("diagnostics", {})
+    diagnostic_logger = DiagnosticLogger(
+        model_dir, f"nn_{update_rule}",
+        enabled=diag_cfg.get("enabled", True),
+        force=force, start_wall=start_wall)
 
     for ep in range(ep_start + 1, total_episodes + 1):
-        epsilon = max(eps_end, eps_start - (eps_start - eps_end) * ep / eps_decay)
-        ep_cost = train_fn(env, model, optimizer, flatten_observation,
-                           gamma=gamma, epsilon=epsilon, device=device)
+        epsilon = (
+            epsilon_schedule.value(ep)
+            if epsilon_schedule is not None
+            else max(eps_end, eps_start - (eps_start - eps_end) * ep / eps_decay)
+        )
+        if lr_schedule is not None:
+            set_optimizer_lr(optimizer, lr_schedule.value(ep))
+        result = train_fn(
+            env, model, optimizer, flatten_observation,
+            gamma=gamma, epsilon=epsilon, device=device,
+            return_diagnostics=diagnostic_logger.enabled)
+        if diagnostic_logger.enabled:
+            ep_cost, diagnostics = result
+            diagnostics["epsilon"] = float(epsilon)
+        else:
+            ep_cost = result
+            diagnostics = {}
         recent_costs.append(ep_cost)
+        diagnostic_logger.log(
+            diagnostics, episode=ep, timestep=ep * 50,
+            wall_time_s=time.time() - start_wall)
 
         with open(log_path, "a") as f:
             f.write(f"{ep},{ep*50},{ep_cost:.2f},"
@@ -1211,10 +1480,33 @@ def train_a3c(config, tc, model_dir, student_config, force):
             for key, value in shared_model.state_dict().items()
         }
 
-    def handle_result(ep_num, ep_cost):
+    # Diagnostic logger is created once start_wall is known below.
+    diagnostic_logger = None
+    worker_returns = deque(maxlen=100)
+    latest_worker_cost = {}
+
+    def handle_result(ep_num, ep_cost, diag=None):
         nonlocal best_cost, processed_results
         processed_results += 1
         recent_costs.append(float(ep_cost))
+
+        if diag and diagnostic_logger is not None:
+            diag = dict(diag)
+            worker_id = int(diag.get("worker_id", -1))
+            worker_return = float(diag.get("worker_return", 0.0))
+            worker_returns.append(worker_return)
+            if worker_id >= 0:
+                latest_worker_cost[worker_id] = float(ep_cost)
+            diag["worker_return_roll_mean"] = float(np.mean(worker_returns))
+            diag["worker_return_roll_std"] = float(np.std(worker_returns))
+            if len(latest_worker_cost) >= 2:
+                costs = list(latest_worker_cost.values())
+                diag["worker_cost_spread"] = float(max(costs) - min(costs))
+            else:
+                diag["worker_cost_spread"] = 0.0
+            diagnostic_logger.log(
+                diag, episode=int(ep_num), timestep=int(ep_num) * 50,
+                wall_time_s=time.time() - start_wall)
 
         if len(recent_costs) == 100:
             rolling = sum(recent_costs) / 100.0
@@ -1224,13 +1516,19 @@ def train_a3c(config, tc, model_dir, student_config, force):
                 print(f"  [best] completed={ep_start + processed_results:,}  "
                       f"rolling100={best_cost:,.0f}")
 
+    def unpack_result(item):
+        if len(item) == 3:
+            return item
+        ep_num, ep_cost = item
+        return ep_num, ep_cost, None
+
     def drain_results_nowait():
         while True:
             try:
-                ep_num, ep_cost = result_queue.get_nowait()
+                item = result_queue.get_nowait()
             except queue_module.Empty:
                 break
-            handle_result(ep_num, ep_cost)
+            handle_result(*unpack_result(item))
 
     start_wall = time.time()
     last_check_wall = start_wall
@@ -1245,6 +1543,10 @@ def train_a3c(config, tc, model_dir, student_config, force):
         force=force,
         trainer_start_wall=start_wall,
     )
+    diag_cfg = config.get("diagnostics", {})
+    diagnostic_logger = DiagnosticLogger(
+        model_dir, "a3c", enabled=diag_cfg.get("enabled", True),
+        force=force, start_wall=start_wall)
     workers = []
     for i in range(n_workers):
         p = mp.Process(target=a3c_worker, args=(
@@ -1327,10 +1629,10 @@ def train_a3c(config, tc, model_dir, student_config, force):
     deadline = time.time() + 5.0
     while processed_results < expected_results and time.time() < deadline:
         try:
-            ep_num, ep_cost = result_queue.get(timeout=0.20)
+            item = result_queue.get(timeout=0.20)
         except queue_module.Empty:
             continue
-        handle_result(ep_num, ep_cost)
+        handle_result(*unpack_result(item))
 
     drain_results_nowait()
 
@@ -1454,6 +1756,14 @@ def main():
     parser.add_argument(
         "--run-name", default=None,
         help="Optional label included in the immutable run record")
+    parser.add_argument(
+        "--set", dest="overrides", action="append", default=[], metavar="KEY=VALUE",
+        help=("Typed config override. Bare keys apply to one selected technique; "
+              "dotted paths are absolute. May be repeated."))
+    parser.add_argument(
+        "--output-root", default=None,
+        help=("Alternative model-output root for isolated experiments/sweeps. "
+              "Default: models/"))
     budget_group = parser.add_mutually_exclusive_group()
     budget_group.add_argument(
         "--timesteps", type=int, default=None,
@@ -1469,12 +1779,24 @@ def main():
                      "set each technique budget in config.yaml instead")
 
     config = load_config()
+    try:
+        config = apply_overrides(
+            config, args.overrides, technique=args.technique)
+    except ValueError as exc:
+        parser.error(str(exc))
     student_config = get_student_config(config)
 
     techniques = all_techniques if args.technique == "all" else [args.technique]
+    if args.output_root:
+        output_root = Path(args.output_root).expanduser()
+        if not output_root.is_absolute():
+            output_root = PROJECT_ROOT / output_root
+        output_root = output_root.resolve()
+    else:
+        output_root = MODELS_DIR
 
     for tech in techniques:
-        model_dir = MODELS_DIR / tech
+        model_dir = output_root / tech
         model_dir.mkdir(parents=True, exist_ok=True)
         (model_dir / "checkpoints").mkdir(exist_ok=True)
 

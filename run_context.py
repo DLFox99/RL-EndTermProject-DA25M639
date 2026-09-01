@@ -245,9 +245,11 @@ class RunContext:
 
         self.eval_metrics_path = self.model_dir / "eval_metrics.csv"
         self.evaluations_path = self.model_dir / "evaluations"
+        self.diagnostics_path = self.model_dir / "diagnostics.csv"
         if self.force:
             self.initial_eval_row_count = 0
             self.initial_evaluation_files = set()
+            self.initial_diagnostic_row_count = 0
         else:
             try:
                 with self.eval_metrics_path.open(newline="", encoding="utf-8") as f:
@@ -258,6 +260,12 @@ class RunContext:
                 {p.name for p in self.evaluations_path.glob("*.json")}
                 if self.evaluations_path.exists() else set()
             )
+            try:
+                with self.diagnostics_path.open(newline="", encoding="utf-8") as f:
+                    self.initial_diagnostic_row_count = sum(
+                        1 for _ in csv.DictReader(f))
+            except Exception:
+                self.initial_diagnostic_row_count = 0
 
         self.target_unit, self.target_total = self._target()
         self.start_progress = self._initial_progress()
@@ -772,6 +780,29 @@ class RunContext:
                     pass
         return copied
 
+    def _copy_diagnostic_records(self) -> Dict[str, Any]:
+        """Copy only diagnostics appended by this invocation."""
+        copied = {"metrics": False, "rows": 0}
+        src = self.model_dir / "diagnostics.csv"
+        if not src.exists() or not src.is_file():
+            return copied
+        try:
+            with src.open(newline="", encoding="utf-8") as f:
+                rows = list(csv.DictReader(f))
+            run_rows = rows[self.initial_diagnostic_row_count:]
+            if not run_rows:
+                return copied
+            dst = self.run_dir / "diagnostics.csv"
+            with dst.open("w", newline="", encoding="utf-8") as f:
+                writer = csv.DictWriter(f, fieldnames=list(run_rows[0].keys()))
+                writer.writeheader()
+                writer.writerows(run_rows)
+            copied["metrics"] = True
+            copied["rows"] = len(run_rows)
+        except Exception as exc:
+            copied["metrics_error"] = str(exc)
+        return copied
+
     def _finalize(self, *, status: str, failure: Optional[Dict[str, Any]]) -> None:
         assert self.started_monotonic is not None
         wall = time.monotonic() - self.started_monotonic
@@ -787,7 +818,10 @@ class RunContext:
         perf = self._rolling_summary(all_rows, run_rows)
         artifacts = self._copy_artifacts()
         evaluation_records = self._copy_evaluation_records()
+        diagnostic_records = self._copy_diagnostic_records()
         evaluation_meta = _read_json(self.model_dir / "evaluation_metadata.json")
+        plateau_meta = evaluation_meta.get("plateau", {}) \
+            if isinstance(evaluation_meta, dict) else {}
 
         final_meta = _read_json(self.metadata_path)
         final_steps = final_meta.get("steps_completed")
@@ -873,6 +907,11 @@ class RunContext:
             "evaluations_completed": evaluation_meta.get("evaluations_completed", 0),
             "evaluation_selection_episodes": evaluation_meta.get(
                 "episodes_per_evaluation"),
+            "eval_plateau_detected": bool(plateau_meta.get("detected", False)),
+            "eval_plateau_first_progress": plateau_meta.get(
+                "first_detected_progress"),
+            "eval_plateau_reason": plateau_meta.get("reason"),
+            "diagnostic_rows": diagnostic_records.get("rows", 0),
             **perf,
         }
         _atomic_json(self.run_dir / "summary.json", summary)
@@ -885,6 +924,7 @@ class RunContext:
                 "failure": failure,
                 "artifacts": artifacts,
                 "evaluation_records": evaluation_records,
+                "diagnostic_records": diagnostic_records,
                 "result": {
                     "steps_completed": final_steps,
                     "episodes_completed": final_episodes,
@@ -912,6 +952,12 @@ class RunContext:
                     "best_eval_mean_cost": evaluation_meta.get("best_mean_cost"),
                     "evaluations_completed": evaluation_meta.get(
                         "evaluations_completed", 0),
+                    "eval_plateau_detected": bool(
+                        plateau_meta.get("detected", False)),
+                    "eval_plateau_first_progress": plateau_meta.get(
+                        "first_detected_progress"),
+                    "eval_plateau_reason": plateau_meta.get("reason"),
+                    "diagnostic_rows": diagnostic_records.get("rows", 0),
                 },
             }
         )
