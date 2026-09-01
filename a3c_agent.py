@@ -139,7 +139,8 @@ def a3c_worker(worker_id, shared_model, shared_optimizer, student_config,
         shared_optimizer.zero_grad()
 
         total_loss.backward()
-        nn.utils.clip_grad_norm_(local_model.parameters(), max_grad_norm)
+        grad_norm = nn.utils.clip_grad_norm_(
+            local_model.parameters(), max_grad_norm)
 
         for local_p, shared_p in zip(local_model.parameters(),
                                       shared_model.parameters()):
@@ -165,8 +166,26 @@ def a3c_worker(worker_id, shared_model, shared_optimizer, student_config,
         with lock:
             completed_counter.value += 1
 
-        # Parent process owns rolling-cost / best-model tracking.
-        result_queue.put((ep_num, float(ep_cost)))
+        # Parent process owns rolling-cost / best-model tracking and writes
+        # diagnostics so worker processes never contend on diagnostics.csv.
+        result_queue.put((
+            ep_num,
+            float(ep_cost),
+            {
+                "worker_id": int(worker_id),
+                "policy_loss": float(policy_loss.detach().item()),
+                "value_loss": float(value_loss.detach().item()),
+                "entropy": float(entropies_t.mean().detach().item()),
+                "total_loss": float(total_loss.detach().item()),
+                "advantage_mean": float(advantages.mean().detach().item()),
+                "advantage_std": float(
+                    advantages.std(unbiased=False).detach().item()),
+                "grad_norm": float(
+                    grad_norm.detach().item()
+                    if hasattr(grad_norm, "detach") else grad_norm),
+                "worker_return": float(sum(rewards)),
+            },
+        ))
 
         if ep_num % 500 == 0:
             print(f"  A3C worker {worker_id}: ep {ep_num:,}  cost={ep_cost:,.0f}")

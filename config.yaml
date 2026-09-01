@@ -6,6 +6,14 @@ wandb:
   enabled: true
   project: "rl-inventory"
 
+diagnostics:
+  enabled: true
+  # SB3 diagnostics are sampled rather than written every environment step.
+  sb3_interval_steps: 10000
+  # DQN/DDQN Q/target-Q statistics use a small no-grad replay probe.
+  sb3_q_probe_interval_steps: 50000
+  sb3_q_probe_batch_size: 128
+
 evaluation:
   # Full offline validation set used by evaluate.py / make eval-*.
   seeds: [100, 101, 102, 103, 104, 105, 106, 107, 108, 109,
@@ -21,6 +29,15 @@ evaluation:
     scenario_modes: ["stationary", "seasonal", "trend", "shock", "random"]
     default_interval_steps: 250000
     default_interval_episodes: 2000
+
+  # Phase 4: advisory plateau detection on deterministic periodic evaluation.
+  # It never shortens a normal training run.
+  plateau:
+    enabled: true
+    min_evaluations: 5
+    patience: 4
+    min_improvement_abs: 500.0
+    min_improvement_frac: 0.005
 
 techniques:
   # ---- SB3 On-Policy ----

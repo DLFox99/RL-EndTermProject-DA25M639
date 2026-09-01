@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Periodic deterministic evaluation and best-eval checkpoint selection."""
+"""Periodic deterministic evaluation, checkpoint selection, and plateau signals."""
 
 from __future__ import annotations
 
@@ -10,9 +10,10 @@ import shutil
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, Optional
+from typing import Any, Callable, Dict, Optional
 
 from evaluation_core import run_policy_evaluation
+from plateau_detection import EvalPlateauDetector
 
 
 SaveBestFn = Callable[[Path], None]
@@ -26,19 +27,23 @@ def _atomic_json(path: Path, payload: Dict[str, Any]) -> None:
     tmp.replace(path)
 
 
-def _read_existing_best(csv_path: Path) -> float:
+def _read_rows(csv_path: Path):
     if not csv_path.exists():
-        return float("inf")
-    best = float("inf")
+        return []
     try:
         with open(csv_path, newline="") as f:
-            for row in csv.DictReader(f):
-                try:
-                    best = min(best, float(row["mean_cost"]))
-                except Exception:
-                    continue
+            return list(csv.DictReader(f))
     except Exception:
-        pass
+        return []
+
+
+def _read_existing_best(csv_path: Path) -> float:
+    best = float("inf")
+    for row in _read_rows(csv_path):
+        try:
+            best = min(best, float(row["mean_cost"]))
+        except Exception:
+            continue
     return best
 
 
@@ -49,11 +54,9 @@ def _next_boundary(progress: int, interval: int) -> int:
 class PeriodicEvaluator:
     """Evaluate the current policy on a fixed selection set during training.
 
-    This object is intentionally algorithm-neutral. Trainers supply:
-      * a `policy_factory` returning a deterministic policy_fn; and
-      * a `save_best_fn(path_without_extension_or_full_path)` callback.
-
-    Evaluation failures are visible but advisory: training continues.
+    Trainers supply a deterministic ``policy_factory`` and a ``save_best_fn``.
+    Evaluation failures and plateau detection are advisory only: neither changes
+    the requested training budget.
     """
 
     CSV_FIELDS = [
@@ -72,6 +75,13 @@ class PeriodicEvaluator:
         "trainer_wall_time_s",
         "timestamp",
         "is_best",
+        # Phase 4: deterministic-evaluation plateau diagnostics.
+        "improvement_abs",
+        "improvement_frac",
+        "significant_improvement",
+        "no_improvement_count",
+        "plateau_detected",
+        "plateau_reason",
     ]
 
     def __init__(
@@ -95,13 +105,14 @@ class PeriodicEvaluator:
         self.progress_unit = progress_unit
         self.trainer_start_wall = trainer_start_wall
 
-        periodic = config.get("evaluation", {}).get("periodic", {})
+        evaluation_cfg = config.get("evaluation", {})
+        periodic = evaluation_cfg.get("periodic", {})
         self.enabled = bool(periodic.get("enabled", True))
         self.seeds = list(periodic.get("seeds", [200, 201, 202, 203]))
         self.scenario_modes = list(
             periodic.get(
                 "scenario_modes",
-                config.get("evaluation", {}).get(
+                evaluation_cfg.get(
                     "scenario_modes",
                     ["stationary", "seasonal", "trend", "shock", "random"],
                 ),
@@ -142,23 +153,60 @@ class PeriodicEvaluator:
                 shutil.rmtree(self.details_dir)
 
         self.details_dir.mkdir(parents=True, exist_ok=True)
+        if not force:
+            self._upgrade_csv_schema_if_needed()
+
+        existing_rows = _read_rows(self.csv_path)
         self.best_mean_cost = _read_existing_best(self.csv_path)
         # A historical CSV without its selected checkpoint is insufficient for
         # resume-time model selection. Force the next successful evaluation to
         # recreate best_eval_model in that case.
         if not any(self.model_dir.glob("best_eval_model.*")):
             self.best_mean_cost = float("inf")
-        self.eval_index = 0
-        if self.csv_path.exists():
-            try:
-                with open(self.csv_path, newline="") as f:
-                    self.eval_index = sum(1 for _ in csv.DictReader(f))
-            except Exception:
-                self.eval_index = 0
+        self.eval_index = len(existing_rows)
+
+        plateau_cfg = evaluation_cfg.get("plateau", {})
+        self.plateau_detector = EvalPlateauDetector(
+            enabled=plateau_cfg.get("enabled", True),
+            min_evaluations=plateau_cfg.get("min_evaluations", 5),
+            patience=plateau_cfg.get("patience", 4),
+            min_improvement_abs=plateau_cfg.get("min_improvement_abs", 500.0),
+            min_improvement_frac=plateau_cfg.get("min_improvement_frac", 0.005),
+        )
+        if not force:
+            self.plateau_detector.replay(existing_rows)
 
         self.next_progress = _next_boundary(start_progress, self.interval) \
             if self.enabled else math.inf
         self.last_evaluated_progress: Optional[int] = None
+
+    @property
+    def plateau_detected(self) -> bool:
+        return bool(self.plateau_detector.state.detected)
+
+    def _upgrade_csv_schema_if_needed(self) -> None:
+        """Extend Phase-2/3 eval CSVs without losing historical rows."""
+        if not self.csv_path.exists() or self.csv_path.stat().st_size == 0:
+            return
+        try:
+            with open(self.csv_path, newline="") as f:
+                reader = csv.DictReader(f)
+                old_fields = list(reader.fieldnames or [])
+                rows = list(reader)
+        except Exception:
+            return
+        if old_fields == self.CSV_FIELDS:
+            return
+        if not old_fields or not set(old_fields).issubset(set(self.CSV_FIELDS)):
+            # Unknown future/nonstandard schema: do not rewrite it silently.
+            return
+        tmp = self.csv_path.with_suffix(self.csv_path.suffix + ".upgrade.tmp")
+        with open(tmp, "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=self.CSV_FIELDS)
+            writer.writeheader()
+            for row in rows:
+                writer.writerow({key: row.get(key, "") for key in self.CSV_FIELDS})
+        tmp.replace(self.csv_path)
 
     def _append_csv(self, row: Dict[str, Any]) -> None:
         exists = self.csv_path.exists() and self.csv_path.stat().st_size > 0
@@ -166,7 +214,7 @@ class PeriodicEvaluator:
             writer = csv.DictWriter(f, fieldnames=self.CSV_FIELDS)
             if not exists:
                 writer.writeheader()
-            writer.writerow(row)
+            writer.writerow({key: row.get(key, "") for key in self.CSV_FIELDS})
 
     def _write_metadata(self, row: Dict[str, Any]) -> None:
         payload = {
@@ -181,6 +229,7 @@ class PeriodicEvaluator:
             "best_mean_cost": (
                 self.best_mean_cost if math.isfinite(self.best_mean_cost) else None
             ),
+            "plateau": self.plateau_detector.state.as_dict(),
             "last_evaluation": row,
         }
         _atomic_json(self.metadata_path, payload)
@@ -223,6 +272,10 @@ class PeriodicEvaluator:
                 print(f"  [eval] WARNING: could not save best_eval_model: {exc}")
                 is_best = False
 
+        plateau_before = self.plateau_detector.state.detected
+        plateau_metrics = self.plateau_detector.observe(
+            result["mean_cost"], int(progress))
+
         trainer_wall = None
         if self.trainer_start_wall is not None:
             trainer_wall = max(time.time() - self.trainer_start_wall, 0.0)
@@ -246,6 +299,7 @@ class PeriodicEvaluator:
             "trainer_wall_time_s": trainer_wall,
             "timestamp": datetime.now().isoformat(),
             "is_best": int(is_best),
+            **plateau_metrics,
         }
         self._append_csv(row)
 
@@ -270,6 +324,12 @@ class PeriodicEvaluator:
             f"std={result['std_cost']:,.0f}  "
             f"time={eval_wall:.2f}s{marker}"
         )
+        if self.plateau_detected and not plateau_before:
+            print(
+                f"  [plateau] advisory detection at "
+                f"{self.progress_unit}={int(progress):,}: "
+                f"{self.plateau_detector.state.reason}. Training continues."
+            )
         return row
 
     def maybe_evaluate(

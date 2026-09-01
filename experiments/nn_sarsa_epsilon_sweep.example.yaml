@@ -1,0 +1,21 @@
+name: nn-sarsa-epsilon
+technique: nn_sarsa
+force: true
+wandb_mode: disabled
+max_parallel: 2
+budget:
+  episodes: 20000
+
+# Applied to every trial. Keys are technique-relative unless they begin with
+# a top-level config section such as evaluation.* or diagnostics.*.
+base_overrides:
+  learning_rate: 0.001
+  device: auto
+
+# Cartesian product. This example uses the legacy linear epsilon parameters;
+# custom schedules can instead be supplied under schedules.epsilon.
+grid:
+  epsilon_end: [0.01, 0.02, 0.05]
+  epsilon_decay_episodes: [10000, 14000, 18000]
+
+repeats: 1

@@ -93,77 +93,138 @@ class TabularAgent:
         self.tables = [data["q0"], data["q1"], data["q2"]]
 
 
+
+
+def _summary(values, *, absolute=False):
+    vals = [float(v) for v in values]
+    if not vals:
+        return float("nan"), float("nan")
+    if absolute:
+        vals = [abs(v) for v in vals]
+    return float(np.mean(vals)), float(np.max(vals))
+
+
+def _tabular_diag(epsilon, td_errors, updates, touched_q, visited_states, n_states):
+    td_mean, td_max = _summary(td_errors, absolute=True)
+    upd_mean, upd_max = _summary(updates, absolute=True)
+    return {
+        "epsilon": float(epsilon),
+        "td_error_abs_mean": td_mean,
+        "td_error_abs_max": td_max,
+        "q_update_abs_mean": upd_mean,
+        "q_update_abs_max": upd_max,
+        "q_touched_min": float(min(touched_q, default=float("nan"))),
+        "q_touched_max": float(max(touched_q, default=float("nan"))),
+        "q_abs_max": float(max((abs(v) for v in touched_q), default=float("nan"))),
+        "state_coverage": float(len(visited_states) / float(n_states)),
+    }
+
 def train_tabular_qlearning(env, discretizer, agent, num_episodes,
                              alpha=0.1, gamma=0.99,
                              epsilon_start=1.0, epsilon_end=0.05,
                              epsilon_decay_episodes=None,
-                             episode_offset=0):
+                             episode_offset=0,
+                             return_diagnostics=False,
+                             epsilon_schedule=None):
     """Q-Learning: off-policy TD(0) with max over next actions."""
     if epsilon_decay_episodes is None:
         epsilon_decay_episodes = int(
             (episode_offset + num_episodes) * 0.7)
 
     history = []
+    visited_states = set()
     for ep in range(num_episodes):
         absolute_ep = episode_offset + ep
-        epsilon = max(
-            epsilon_end,
-            epsilon_start
-            - (epsilon_start - epsilon_end)
-            * absolute_ep / epsilon_decay_episodes)
+        epsilon = (
+            float(epsilon_schedule(absolute_ep))
+            if epsilon_schedule is not None
+            else max(
+                epsilon_end,
+                epsilon_start
+                - (epsilon_start - epsilon_end)
+                * absolute_ep / epsilon_decay_episodes)
+        )
         obs, _ = env.reset()
         state = discretizer.discretize(obs)
+        if return_diagnostics:
+            visited_states.add(state)
         done = False
         ep_cost = 0
+        td_errors, updates, touched_q = [], [], []
 
         while not done:
             actions = agent.get_actions(state, epsilon)
             action_array = np.array(actions, dtype=np.int64)
             next_obs, reward, terminated, truncated, info = env.step(action_array)
             next_state = discretizer.discretize(next_obs)
+            if return_diagnostics:
+                visited_states.add(next_state)
             done = terminated or truncated
 
             # Q-Learning update (per product)
             for i in range(3):
                 best_next = np.max(agent.tables[i][next_state])
                 td_target = reward + gamma * best_next * (1 - int(done))
-                td_error = td_target - agent.tables[i][state, actions[i]]
-                agent.tables[i][state, actions[i]] += alpha * td_error
+                old_q = agent.tables[i][state, actions[i]]
+                td_error = td_target - old_q
+                update = alpha * td_error
+                agent.tables[i][state, actions[i]] += update
+                if return_diagnostics:
+                    td_errors.append(float(td_error))
+                    updates.append(float(update))
+                    touched_q.append(float(agent.tables[i][state, actions[i]]))
 
             state = next_state
             ep_cost += (-reward * 100)
 
         history.append(ep_cost)
-        yield ep, ep_cost  # generator for checkpointing in train.py
+        if return_diagnostics:
+            yield ep, ep_cost, _tabular_diag(
+                epsilon, td_errors, updates, touched_q,
+                visited_states, agent.n_states)
+        else:
+            yield ep, ep_cost  # generator for checkpointing in train.py
 
 
 def train_tabular_sarsa(env, discretizer, agent, num_episodes,
                          alpha=0.1, gamma=0.99,
                          epsilon_start=1.0, epsilon_end=0.05,
                          epsilon_decay_episodes=None,
-                         episode_offset=0):
+                         episode_offset=0,
+                         return_diagnostics=False,
+                         epsilon_schedule=None):
     """SARSA: on-policy TD(0)."""
     if epsilon_decay_episodes is None:
         epsilon_decay_episodes = int(
             (episode_offset + num_episodes) * 0.7)
 
+    visited_states = set()
     for ep in range(num_episodes):
         absolute_ep = episode_offset + ep
-        epsilon = max(
-            epsilon_end,
-            epsilon_start
-            - (epsilon_start - epsilon_end)
-            * absolute_ep / epsilon_decay_episodes)
+        epsilon = (
+            float(epsilon_schedule(absolute_ep))
+            if epsilon_schedule is not None
+            else max(
+                epsilon_end,
+                epsilon_start
+                - (epsilon_start - epsilon_end)
+                * absolute_ep / epsilon_decay_episodes)
+        )
         obs, _ = env.reset()
         state = discretizer.discretize(obs)
+        if return_diagnostics:
+            visited_states.add(state)
         actions = agent.get_actions(state, epsilon)
         done = False
         ep_cost = 0
+        td_errors, updates, touched_q = [], [], []
 
         while not done:
             action_array = np.array(actions, dtype=np.int64)
             next_obs, reward, terminated, truncated, info = env.step(action_array)
             next_state = discretizer.discretize(next_obs)
+            if return_diagnostics:
+                visited_states.add(next_state)
             done = terminated or truncated
 
             next_actions = agent.get_actions(next_state, epsilon)
@@ -172,21 +233,34 @@ def train_tabular_sarsa(env, discretizer, agent, num_episodes,
             for i in range(3):
                 next_q = agent.tables[i][next_state, next_actions[i]] * (1 - int(done))
                 td_target = reward + gamma * next_q
-                td_error = td_target - agent.tables[i][state, actions[i]]
-                agent.tables[i][state, actions[i]] += alpha * td_error
+                old_q = agent.tables[i][state, actions[i]]
+                td_error = td_target - old_q
+                update = alpha * td_error
+                agent.tables[i][state, actions[i]] += update
+                if return_diagnostics:
+                    td_errors.append(float(td_error))
+                    updates.append(float(update))
+                    touched_q.append(float(agent.tables[i][state, actions[i]]))
 
             state = next_state
             actions = next_actions
             ep_cost += (-reward * 100)
 
-        yield ep, ep_cost
+        if return_diagnostics:
+            yield ep, ep_cost, _tabular_diag(
+                epsilon, td_errors, updates, touched_q,
+                visited_states, agent.n_states)
+        else:
+            yield ep, ep_cost
 
 
 def train_td_lambda(env, discretizer, agent, num_episodes,
                      alpha=0.1, gamma=0.99, lambd=0.8,
                      epsilon_start=1.0, epsilon_end=0.05,
                      epsilon_decay_episodes=None,
-                     episode_offset=0):
+                     episode_offset=0,
+                     return_diagnostics=False,
+                     epsilon_schedule=None):
     """TD(λ) with eligibility traces (SARSA-style, replacing traces)."""
     if epsilon_decay_episodes is None:
         epsilon_decay_episodes = int(
@@ -194,27 +268,38 @@ def train_td_lambda(env, discretizer, agent, num_episodes,
 
     trace_decay = gamma * lambd
 
+    visited_states = set()
     for ep in range(num_episodes):
         absolute_ep = episode_offset + ep
-        epsilon = max(
-            epsilon_end,
-            epsilon_start
-            - (epsilon_start - epsilon_end)
-            * absolute_ep / epsilon_decay_episodes)
+        epsilon = (
+            float(epsilon_schedule(absolute_ep))
+            if epsilon_schedule is not None
+            else max(
+                epsilon_end,
+                epsilon_start
+                - (epsilon_start - epsilon_end)
+                * absolute_ep / epsilon_decay_episodes)
+        )
 
         # Sparse replacing traces: only active state-action pairs are stored.
         traces = [dict() for _ in agent.tables]
 
         obs, _ = env.reset()
         state = discretizer.discretize(obs)
+        if return_diagnostics:
+            visited_states.add(state)
         actions = agent.get_actions(state, epsilon)
         done = False
         ep_cost = 0
+        td_errors, updates, touched_q = [], [], []
+        active_counts, trace_values = [], []
 
         while not done:
             action_array = np.array(actions, dtype=np.int64)
             next_obs, reward, terminated, truncated, info = env.step(action_array)
             next_state = discretizer.discretize(next_obs)
+            if return_diagnostics:
+                visited_states.add(next_state)
             done = terminated or truncated
 
             next_actions = agent.get_actions(next_state, epsilon)
@@ -234,10 +319,34 @@ def train_td_lambda(env, discretizer, agent, num_episodes,
                 # Update only entries with non-zero eligibility.
                 table = agent.tables[i]
                 for (s, a), eligibility in trace.items():
-                    table[s, a] += alpha * td_error * eligibility
+                    update = alpha * td_error * eligibility
+                    table[s, a] += update
+                    if return_diagnostics:
+                        updates.append(float(update))
+                        touched_q.append(float(table[s, a]))
+
+                if return_diagnostics:
+                    td_errors.append(float(td_error))
+                    active_counts.append(len(trace))
+                    trace_values.extend(float(v) for v in trace.values())
 
             state = next_state
             actions = next_actions
             ep_cost += (-reward * 100)
 
-        yield ep, ep_cost
+        if return_diagnostics:
+            diag = _tabular_diag(
+                epsilon, td_errors, updates, touched_q,
+                visited_states, agent.n_states)
+            diag.update({
+                "active_trace_mean": float(np.mean(active_counts))
+                    if active_counts else float("nan"),
+                "active_trace_max": float(max(active_counts, default=float("nan"))),
+                "trace_abs_mean": float(np.mean(np.abs(trace_values)))
+                    if trace_values else float("nan"),
+                "trace_abs_max": float(max((abs(v) for v in trace_values),
+                                           default=float("nan"))),
+            })
+            yield ep, ep_cost, diag
+        else:
+            yield ep, ep_cost

@@ -52,13 +52,65 @@ def _obs_tensor(obs, flatten_fn, device):
     ).unsqueeze(0)
 
 
+
+
+def _diag_summary(losses, td_errors, selected_q, targets, grad_norms, all_q, epsilon):
+    """Summarize detached tensors with only end-of-episode device syncs."""
+    def cat(values):
+        if not values:
+            return None
+        return torch.cat([v.detach().reshape(-1) for v in values])
+
+    loss_t = cat(losses)
+    td_t = cat(td_errors)
+    selected_t = cat(selected_q)
+    target_t = cat(targets)
+    grad_t = cat(grad_norms)
+    q_t = cat(all_q)
+
+    def mean(t):
+        return float(t.mean().item()) if t is not None and t.numel() else float("nan")
+
+    def std(t):
+        return float(t.std(unbiased=False).item()) if t is not None and t.numel() else float("nan")
+
+    def abs_mean(t):
+        return float(t.abs().mean().item()) if t is not None and t.numel() else float("nan")
+
+    def abs_max(t):
+        return float(t.abs().max().item()) if t is not None and t.numel() else float("nan")
+
+    return {
+        "epsilon": float(epsilon),
+        "loss_mean": mean(loss_t),
+        "td_error_abs_mean": abs_mean(td_t),
+        "td_error_abs_max": abs_max(td_t),
+        "selected_q_mean": mean(selected_t),
+        "selected_q_std": std(selected_t),
+        "target_mean": mean(target_t),
+        "target_std": std(target_t),
+        "grad_norm_mean": mean(grad_t),
+        "grad_norm_max": float(grad_t.max().item())
+            if grad_t is not None and grad_t.numel() else float("nan"),
+        "q_min": float(q_t.min().item())
+            if q_t is not None and q_t.numel() else float("nan"),
+        "q_max": float(q_t.max().item())
+            if q_t is not None and q_t.numel() else float("nan"),
+        "q_abs_max": abs_max(q_t),
+    }
+
 def train_nn_qlearning_episode(env, model, optimizer, flatten_fn,
                                 gamma=0.99, epsilon=0.1,
-                                device=torch.device("cpu")):
-    """Run one episode of online NN Q-Learning. Returns episode cost."""
+                                device=torch.device("cpu"),
+                                return_diagnostics=False):
+    """Run one online NN Q-Learning episode with optional diagnostics."""
     obs, _ = env.reset()
     done = False
     ep_cost = 0.0
+
+    losses, td_errors = [], []
+    selected_q_values, target_values = [], []
+    grad_norms, all_q_values = [], []
 
     while not done:
         obs_t = _obs_tensor(obs, flatten_fn, device)
@@ -84,25 +136,47 @@ def train_nn_qlearning_episode(env, model, optimizer, flatten_fn,
 
         # Loss: sum of per-product TD errors
         loss = 0
+        step_selected, step_targets = [], []
         for i in range(3):
             q_sa = current_q[i][0, actions[i]]
-            loss += F.mse_loss(q_sa, targets[i].squeeze())
+            target_scalar = targets[i].squeeze()
+            loss += F.mse_loss(q_sa, target_scalar)
+            if return_diagnostics:
+                q_det = q_sa.detach().reshape(1)
+                t_det = target_scalar.detach().reshape(1)
+                step_selected.append(q_det)
+                step_targets.append(t_det)
+                td_errors.append(t_det - q_det)
 
         optimizer.zero_grad()
         loss.backward()
-        nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        grad_norm = nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
+
+        if return_diagnostics:
+            losses.append(loss.detach().reshape(1))
+            selected_q_values.extend(step_selected)
+            target_values.extend(step_targets)
+            grad_norms.append(grad_norm.detach().reshape(1))
+            all_q_values.append(torch.cat([
+                head.detach().reshape(-1) for head in current_q
+            ]))
 
         obs = next_obs
         ep_cost += (-reward * 100)
 
+    if return_diagnostics:
+        return ep_cost, _diag_summary(
+            losses, td_errors, selected_q_values, target_values,
+            grad_norms, all_q_values, epsilon)
     return ep_cost
 
 
 def train_nn_sarsa_episode(env, model, optimizer, flatten_fn,
                             gamma=0.99, epsilon=0.1,
-                            device=torch.device("cpu")):
-    """Run one episode of online NN SARSA. Returns episode cost."""
+                            device=torch.device("cpu"),
+                            return_diagnostics=False):
+    """Run one online NN SARSA episode with optional diagnostics."""
     obs, _ = env.reset()
     obs_t = _obs_tensor(obs, flatten_fn, device)
 
@@ -111,6 +185,10 @@ def train_nn_sarsa_episode(env, model, optimizer, flatten_fn,
 
     done = False
     ep_cost = 0.0
+
+    losses, td_errors = [], []
+    selected_q_values, target_values = [], []
+    grad_norms, all_q_values = [], []
 
     while not done:
         action_array = np.array(actions, dtype=np.int64)
@@ -126,19 +204,39 @@ def train_nn_sarsa_episode(env, model, optimizer, flatten_fn,
 
         # SARSA target: r + γ Q(s', a') where a' is the next action taken
         loss = 0
+        step_selected, step_targets = [], []
         for i in range(3):
             next_q = next_q_vals[i][0, next_actions[i]] * (1 - int(done))
             target = reward + gamma * next_q
             q_sa = current_q[i][0, actions[i]]
             loss += F.mse_loss(q_sa, target.detach())
+            if return_diagnostics:
+                q_det = q_sa.detach().reshape(1)
+                t_det = target.detach().reshape(1)
+                step_selected.append(q_det)
+                step_targets.append(t_det)
+                td_errors.append(t_det - q_det)
 
         optimizer.zero_grad()
         loss.backward()
-        nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        grad_norm = nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
+
+        if return_diagnostics:
+            losses.append(loss.detach().reshape(1))
+            selected_q_values.extend(step_selected)
+            target_values.extend(step_targets)
+            grad_norms.append(grad_norm.detach().reshape(1))
+            all_q_values.append(torch.cat([
+                head.detach().reshape(-1) for head in current_q
+            ]))
 
         obs_t = next_obs_t
         actions = next_actions
         ep_cost += (-reward * 100)
 
+    if return_diagnostics:
+        return ep_cost, _diag_summary(
+            losses, td_errors, selected_q_values, target_values,
+            grad_norms, all_q_values, epsilon)
     return ep_cost
