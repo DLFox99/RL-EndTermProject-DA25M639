@@ -70,8 +70,9 @@ class SharedAdam(torch.optim.Adam):
 
 
 def a3c_worker(worker_id, shared_model, shared_optimizer, student_config,
-               flatten_fn, n_steps, total_episodes, global_counter, lock,
-               log_path, gamma=0.99, ent_coef=0.01, max_grad_norm=1.0,
+               flatten_fn, n_steps, total_episodes, assignment_counter,
+               completed_counter, lock, result_queue, log_path,
+               gamma=0.99, ent_coef=0.01, max_grad_norm=1.0,
                hidden=128):
     """A3C worker process."""
     from industrial_inventory_env import IndustrialInventoryEnv
@@ -81,13 +82,14 @@ def a3c_worker(worker_id, shared_model, shared_optimizer, student_config,
     local_model = ActorCritic(hidden=hidden)
 
     while True:
-        # Check global episode counter
+        # Reserve a unique episode number. This counter represents
+        # ASSIGNED work only; completed_counter is updated after the episode.
         with lock:
-            current_ep = global_counter.value
+            current_ep = assignment_counter.value
             if current_ep >= total_episodes:
                 break
-            global_counter.value += 1
-            ep_num = global_counter.value
+            assignment_counter.value += 1
+            ep_num = assignment_counter.value
 
         # Sync local model
         local_model.load_state_dict(shared_model.state_dict())
@@ -131,28 +133,40 @@ def a3c_worker(worker_id, shared_model, shared_optimizer, student_config,
 
         total_loss = policy_loss + 0.5 * value_loss + ent_coef * entropy_loss
 
-        # Push gradients to shared model
+        # Push gradients to the shared model. total_loss belongs to
+        # local_model, so its gradients must be cleared every episode.
+        local_model.zero_grad(set_to_none=True)
         shared_optimizer.zero_grad()
+
         total_loss.backward()
         nn.utils.clip_grad_norm_(local_model.parameters(), max_grad_norm)
 
         for local_p, shared_p in zip(local_model.parameters(),
                                       shared_model.parameters()):
-            if shared_p.grad is None:
-                shared_p._grad = local_p.grad.clone()
+            if local_p.grad is None:
+                shared_p._grad = None
             else:
-                shared_p._grad = local_p.grad.clone()
+                shared_p._grad = local_p.grad.detach().clone()
 
         shared_optimizer.step()
 
         # Log episode cost
         ep_cost = sum(-r * 100 for r in rewards)
         try:
-            with open(log_path, "a") as f:
-                f.write(f"{ep_num},{ep_num * 50},{ep_cost:.2f},"
-                        f"0,worker_{worker_id}\n")
+            # Serialize one complete CSV-line write across workers.
+            with lock:
+                with open(log_path, "a") as f:
+                    f.write(f"{ep_num},{ep_num * 50},{ep_cost:.2f},"
+                            f"0,worker_{worker_id}\n")
         except Exception:
             pass  # don't crash worker on logging failure
+
+        # Mark completion only after rollout + shared-model update finish.
+        with lock:
+            completed_counter.value += 1
+
+        # Parent process owns rolling-cost / best-model tracking.
+        result_queue.put((ep_num, float(ep_cost)))
 
         if ep_num % 500 == 0:
             print(f"  A3C worker {worker_id}: ep {ep_num:,}  cost={ep_cost:,.0f}")

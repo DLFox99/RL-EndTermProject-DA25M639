@@ -125,6 +125,7 @@ techniques:
     gamma: 0.99
     epsilon_start: 1.0
     epsilon_end: 0.05
+    epsilon_decay_episodes: 35000
 
   tabular_sarsa:
     algo: TabularSARSA
@@ -137,6 +138,7 @@ techniques:
     gamma: 0.99
     epsilon_start: 1.0
     epsilon_end: 0.05
+    epsilon_decay_episodes: 35000
 
   td_lambda:
     algo: TDLambda
@@ -150,6 +152,7 @@ techniques:
     lambd: 0.8
     epsilon_start: 1.0
     epsilon_end: 0.05
+    epsilon_decay_episodes: 35000
 
   # ---- Custom NN ----
   nn_qlearning:
@@ -164,6 +167,8 @@ techniques:
     hidden: 128
     epsilon_start: 1.0
     epsilon_end: 0.05
+    epsilon_decay_episodes: 14000
+    device: auto
 
   nn_sarsa:
     algo: NNSarsa
@@ -177,3 +182,5 @@ techniques:
     hidden: 128
     epsilon_start: 1.0
     epsilon_end: 0.05
+    epsilon_decay_episodes: 14000
+    device: auto

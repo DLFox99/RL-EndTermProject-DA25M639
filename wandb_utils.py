@@ -54,7 +54,7 @@ def init(technique_name, config, tech_config):
         )
         _enabled = True
         print(f"  [wandb] logging to project '{project}' as '{run_name}'")
-        print(f"  [wandb] dashboard: {_run.get_url()}")
+        print(f"  [wandb] dashboard: {getattr(_run, 'url', None)}")
     except Exception as e:
         print(f"  [wandb] init failed: {e} — continuing without wandb")
         _enabled = False

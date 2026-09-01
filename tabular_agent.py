@@ -96,15 +96,21 @@ class TabularAgent:
 def train_tabular_qlearning(env, discretizer, agent, num_episodes,
                              alpha=0.1, gamma=0.99,
                              epsilon_start=1.0, epsilon_end=0.05,
-                             epsilon_decay_episodes=None):
+                             epsilon_decay_episodes=None,
+                             episode_offset=0):
     """Q-Learning: off-policy TD(0) with max over next actions."""
     if epsilon_decay_episodes is None:
-        epsilon_decay_episodes = int(num_episodes * 0.7)
+        epsilon_decay_episodes = int(
+            (episode_offset + num_episodes) * 0.7)
 
     history = []
     for ep in range(num_episodes):
-        epsilon = max(epsilon_end,
-                      epsilon_start - (epsilon_start - epsilon_end) * ep / epsilon_decay_episodes)
+        absolute_ep = episode_offset + ep
+        epsilon = max(
+            epsilon_end,
+            epsilon_start
+            - (epsilon_start - epsilon_end)
+            * absolute_ep / epsilon_decay_episodes)
         obs, _ = env.reset()
         state = discretizer.discretize(obs)
         done = False
@@ -134,14 +140,20 @@ def train_tabular_qlearning(env, discretizer, agent, num_episodes,
 def train_tabular_sarsa(env, discretizer, agent, num_episodes,
                          alpha=0.1, gamma=0.99,
                          epsilon_start=1.0, epsilon_end=0.05,
-                         epsilon_decay_episodes=None):
+                         epsilon_decay_episodes=None,
+                         episode_offset=0):
     """SARSA: on-policy TD(0)."""
     if epsilon_decay_episodes is None:
-        epsilon_decay_episodes = int(num_episodes * 0.7)
+        epsilon_decay_episodes = int(
+            (episode_offset + num_episodes) * 0.7)
 
     for ep in range(num_episodes):
-        epsilon = max(epsilon_end,
-                      epsilon_start - (epsilon_start - epsilon_end) * ep / epsilon_decay_episodes)
+        absolute_ep = episode_offset + ep
+        epsilon = max(
+            epsilon_end,
+            epsilon_start
+            - (epsilon_start - epsilon_end)
+            * absolute_ep / epsilon_decay_episodes)
         obs, _ = env.reset()
         state = discretizer.discretize(obs)
         actions = agent.get_actions(state, epsilon)
@@ -173,17 +185,25 @@ def train_tabular_sarsa(env, discretizer, agent, num_episodes,
 def train_td_lambda(env, discretizer, agent, num_episodes,
                      alpha=0.1, gamma=0.99, lambd=0.8,
                      epsilon_start=1.0, epsilon_end=0.05,
-                     epsilon_decay_episodes=None):
+                     epsilon_decay_episodes=None,
+                     episode_offset=0):
     """TD(λ) with eligibility traces (SARSA-style, replacing traces)."""
     if epsilon_decay_episodes is None:
-        epsilon_decay_episodes = int(num_episodes * 0.7)
+        epsilon_decay_episodes = int(
+            (episode_offset + num_episodes) * 0.7)
+
+    trace_decay = gamma * lambd
 
     for ep in range(num_episodes):
-        epsilon = max(epsilon_end,
-                      epsilon_start - (epsilon_start - epsilon_end) * ep / epsilon_decay_episodes)
+        absolute_ep = episode_offset + ep
+        epsilon = max(
+            epsilon_end,
+            epsilon_start
+            - (epsilon_start - epsilon_end)
+            * absolute_ep / epsilon_decay_episodes)
 
-        # Reset eligibility traces
-        traces = [np.zeros_like(t) for t in agent.tables]
+        # Sparse replacing traces: only active state-action pairs are stored.
+        traces = [dict() for _ in agent.tables]
 
         obs, _ = env.reset()
         state = discretizer.discretize(obs)
@@ -203,12 +223,18 @@ def train_td_lambda(env, discretizer, agent, num_episodes,
                 next_q = agent.tables[i][next_state, next_actions[i]] * (1 - int(done))
                 td_error = reward + gamma * next_q - agent.tables[i][state, actions[i]]
 
-                # Replacing traces
-                traces[i] *= gamma * lambd
-                traces[i][state, actions[i]] = 1.0
+                # Decay only currently active traces.
+                trace = traces[i]
+                for key in trace:
+                    trace[key] *= trace_decay
 
-                # Update all entries proportional to trace
-                agent.tables[i] += alpha * td_error * traces[i]
+                # Replacing trace for the current state-action pair.
+                trace[(state, actions[i])] = 1.0
+
+                # Update only entries with non-zero eligibility.
+                table = agent.tables[i]
+                for (s, a), eligibility in trace.items():
+                    table[s, a] += alpha * td_error * eligibility
 
             state = next_state
             actions = next_actions

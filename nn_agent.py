@@ -45,15 +45,23 @@ class QNetworkFactored(nn.Module):
         return actions, q_values
 
 
+def _obs_tensor(obs, flatten_fn, device):
+    # Convert one observation to a 1 x obs_dim tensor on device.
+    return torch.as_tensor(
+        flatten_fn(obs), dtype=torch.float32, device=device
+    ).unsqueeze(0)
+
+
 def train_nn_qlearning_episode(env, model, optimizer, flatten_fn,
-                                gamma=0.99, epsilon=0.1):
+                                gamma=0.99, epsilon=0.1,
+                                device=torch.device("cpu")):
     """Run one episode of online NN Q-Learning. Returns episode cost."""
     obs, _ = env.reset()
     done = False
     ep_cost = 0.0
 
     while not done:
-        obs_t = torch.FloatTensor(flatten_fn(obs)).unsqueeze(0)
+        obs_t = _obs_tensor(obs, flatten_fn, device)
 
         with torch.no_grad():
             actions, _ = model.get_actions(obs_t, epsilon)
@@ -63,7 +71,7 @@ def train_nn_qlearning_episode(env, model, optimizer, flatten_fn,
         done = terminated or truncated
 
         # Compute target: r + γ max_a' Q(s', a') for each product
-        next_obs_t = torch.FloatTensor(flatten_fn(next_obs)).unsqueeze(0)
+        next_obs_t = _obs_tensor(next_obs, flatten_fn, device)
         current_q = model(obs_t)
 
         with torch.no_grad():
@@ -92,10 +100,11 @@ def train_nn_qlearning_episode(env, model, optimizer, flatten_fn,
 
 
 def train_nn_sarsa_episode(env, model, optimizer, flatten_fn,
-                            gamma=0.99, epsilon=0.1):
+                            gamma=0.99, epsilon=0.1,
+                            device=torch.device("cpu")):
     """Run one episode of online NN SARSA. Returns episode cost."""
     obs, _ = env.reset()
-    obs_t = torch.FloatTensor(flatten_fn(obs)).unsqueeze(0)
+    obs_t = _obs_tensor(obs, flatten_fn, device)
 
     with torch.no_grad():
         actions, _ = model.get_actions(obs_t, epsilon)
@@ -108,7 +117,7 @@ def train_nn_sarsa_episode(env, model, optimizer, flatten_fn,
         next_obs, reward, terminated, truncated, info = env.step(action_array)
         done = terminated or truncated
 
-        next_obs_t = torch.FloatTensor(flatten_fn(next_obs)).unsqueeze(0)
+        next_obs_t = _obs_tensor(next_obs, flatten_fn, device)
         current_q = model(obs_t)
 
         with torch.no_grad():

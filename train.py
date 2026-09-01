@@ -689,7 +689,11 @@ def train_tabular(config, tc, model_dir, student_config, force):
     elif force:
         for f in model_dir.iterdir():
             if f.is_file(): f.unlink()
-        (model_dir / "checkpoints").mkdir(exist_ok=True)
+        ckpt_dir = model_dir / "checkpoints"
+        ckpt_dir.mkdir(exist_ok=True)
+        for f in ckpt_dir.iterdir():
+            if f.is_file() or f.is_symlink():
+                f.unlink()
 
     with open(model_dir / "hyperparams_used.yaml", "w") as f:
         yaml.dump(tc, f, default_flow_style=False)
@@ -720,6 +724,8 @@ def train_tabular(config, tc, model_dir, student_config, force):
         alpha=tc.get("alpha", 0.1), gamma=tc.get("gamma", 0.99),
         epsilon_start=tc.get("epsilon_start", 1.0),
         epsilon_end=tc.get("epsilon_end", 0.05),
+        epsilon_decay_episodes=tc.get("epsilon_decay_episodes"),
+        episode_offset=ep_start,
     )
 
     if update_rule == "qlearning":
@@ -816,6 +822,16 @@ def train_nn_custom(config, tc, model_dir, student_config, force):
     ckpt_sec = config.get("checkpoint_interval_min", 5) * 60
     name = tc.get("portal_name", update_rule)
 
+    requested_device = str(tc.get("device", "auto")).lower()
+    if requested_device == "auto":
+        device = torch.device(
+            "cuda" if torch.cuda.is_available() else "cpu")
+    else:
+        device = torch.device(requested_device)
+    if device.type == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError(
+            f"{name}: device='cuda' requested but CUDA is not available")
+
     # --- wandb init ---
     wandb_utils.init(tc.get("update_rule", "nn_custom"), config, tc)
 
@@ -826,7 +842,7 @@ def train_nn_custom(config, tc, model_dir, student_config, force):
         print(f"{name}: already at {meta['episodes_completed']:,} episodes.")
         return
 
-    model = QNetworkFactored(hidden=hidden)
+    model = QNetworkFactored(hidden=hidden).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
 
     ckpt_path = model_dir / "checkpoints" / "checkpoint.pt"
@@ -836,7 +852,8 @@ def train_nn_custom(config, tc, model_dir, student_config, force):
 
     if not force and ckpt_path.exists():
         print(f"{name}: resuming from checkpoint")
-        ckpt_data = torch.load(str(ckpt_path), map_location="cpu", weights_only=False)
+        ckpt_data = torch.load(
+            str(ckpt_path), map_location=device, weights_only=False)
         model.load_state_dict(ckpt_data["model_state"])
         optimizer.load_state_dict(ckpt_data["optimizer_state"])
         ep_start = ckpt_data.get("episode", 0)
@@ -844,7 +861,7 @@ def train_nn_custom(config, tc, model_dir, student_config, force):
     elif not force and final_path.exists():
         print(f"{name}: resuming from final_model.pt (optimizer state reset)")
         model.load_state_dict(
-            torch.load(str(final_path), map_location="cpu", weights_only=True))
+            torch.load(str(final_path), map_location=device, weights_only=True))
         if meta:
             ep_start = meta.get("episodes_completed", 0)
             best_cost = meta.get("best_rolling_cost") or float("inf")
@@ -854,16 +871,23 @@ def train_nn_custom(config, tc, model_dir, student_config, force):
     elif force:
         for f in model_dir.iterdir():
             if f.is_file(): f.unlink()
-        (model_dir / "checkpoints").mkdir(exist_ok=True)
+        ckpt_dir = model_dir / "checkpoints"
+        ckpt_dir.mkdir(exist_ok=True)
+        for f in ckpt_dir.iterdir():
+            if f.is_file() or f.is_symlink():
+                f.unlink()
 
     with open(model_dir / "hyperparams_used.yaml", "w") as f:
-        yaml.dump(tc, f, default_flow_style=False)
+        used_params = dict(tc)
+        used_params["resolved_device"] = str(device)
+        yaml.dump(used_params, f, default_flow_style=False)
 
     if ep_start >= total_episodes:
         print(f"{name}: fully trained.")
         return
 
-    print(f"{name}: training episodes {ep_start:,} → {total_episodes:,}")
+    print(f"{name}: training episodes {ep_start:,} → {total_episodes:,} "
+          f"on {device}")
 
     env = IndustrialInventoryEnv(student_config, scenario_mode="random",
                                   domain_randomization=True)
@@ -878,7 +902,8 @@ def train_nn_custom(config, tc, model_dir, student_config, force):
 
     eps_start = tc.get("epsilon_start", 1.0)
     eps_end = tc.get("epsilon_end", 0.05)
-    eps_decay = int(total_episodes * 0.7)
+    eps_decay = tc.get(
+        "epsilon_decay_episodes", int(total_episodes * 0.7))
 
     start_wall = time.time()
     last_ckpt_wall = start_wall
@@ -887,7 +912,7 @@ def train_nn_custom(config, tc, model_dir, student_config, force):
     for ep in range(ep_start + 1, total_episodes + 1):
         epsilon = max(eps_end, eps_start - (eps_start - eps_end) * ep / eps_decay)
         ep_cost = train_fn(env, model, optimizer, flatten_observation,
-                           gamma=gamma, epsilon=epsilon)
+                           gamma=gamma, epsilon=epsilon, device=device)
         recent_costs.append(ep_cost)
 
         with open(log_path, "a") as f:
@@ -957,6 +982,9 @@ def train_nn_custom(config, tc, model_dir, student_config, force):
 # ---------------------------------------------------------------------------
 
 def train_a3c(config, tc, model_dir, student_config, force):
+    import queue as queue_module
+    from collections import deque
+
     import torch
     import torch.multiprocessing as mp
     from a3c_agent import ActorCritic, SharedAdam, a3c_worker
@@ -981,7 +1009,11 @@ def train_a3c(config, tc, model_dir, student_config, force):
     if force:
         for f in model_dir.iterdir():
             if f.is_file(): f.unlink()
-        (model_dir / "checkpoints").mkdir(exist_ok=True)
+        ckpt_dir = model_dir / "checkpoints"
+        ckpt_dir.mkdir(exist_ok=True)
+        for f in ckpt_dir.iterdir():
+            if f.is_file() or f.is_symlink():
+                f.unlink()
 
     with open(model_dir / "hyperparams_used.yaml", "w") as f:
         yaml.dump(tc, f, default_flow_style=False)
@@ -1009,13 +1041,70 @@ def train_a3c(config, tc, model_dir, student_config, force):
     if not force and ckpt_path.exists():
         shared_model.load_state_dict(
             torch.load(str(ckpt_path), map_location="cpu", weights_only=True))
-        print(f"{name}: loaded checkpoint")
+        print(f"{name}: loaded checkpoint "
+              f"(model weights; SharedAdam state reset)")
     shared_model.share_memory()
 
     shared_optimizer = SharedAdam(shared_model.parameters(),
                                   lr=tc.get("learning_rate", 1e-4))
-    global_counter = mp.Value("i", ep_start)
+
+    # Keep assignment and completion separate. With N asynchronous workers,
+    # assignment_counter can be ahead by up to N episodes.
+    assignment_counter = mp.Value("i", ep_start)
+    completed_counter = mp.Value("i", ep_start)
     lock = mp.Lock()
+    result_queue = mp.Queue()
+
+    best_model_path = model_dir / "best_model.pt"
+    best_cost = float("inf")
+    if not force and meta:
+        previous_best = meta.get("best_rolling_cost")
+        if previous_best is not None and best_model_path.exists():
+            best_cost = float(previous_best)
+
+    # Seed rolling-100 with up to 99 prior completed episode costs on resume.
+    recent_costs = deque(maxlen=100)
+    if not force and ep_start > 0 and log_path.exists():
+        try:
+            prior_costs = []
+            with open(log_path, "r") as f:
+                next(f, None)
+                for line in f:
+                    parts = line.strip().split(",")
+                    if len(parts) >= 3:
+                        prior_costs.append(float(parts[2]))
+            recent_costs.extend(prior_costs[-99:])
+        except Exception as exc:
+            print(f"{name}: could not seed rolling-cost window: {exc}")
+
+    processed_results = 0
+
+    def snapshot_shared_model():
+        return {
+            key: value.detach().cpu().clone()
+            for key, value in shared_model.state_dict().items()
+        }
+
+    def handle_result(ep_num, ep_cost):
+        nonlocal best_cost, processed_results
+        processed_results += 1
+        recent_costs.append(float(ep_cost))
+
+        if len(recent_costs) == 100:
+            rolling = sum(recent_costs) / 100.0
+            if rolling < best_cost:
+                best_cost = rolling
+                torch.save(snapshot_shared_model(), str(best_model_path))
+                print(f"  [best] completed={ep_start + processed_results:,}  "
+                      f"rolling100={best_cost:,.0f}")
+
+    def drain_results_nowait():
+        while True:
+            try:
+                ep_num, ep_cost = result_queue.get_nowait()
+            except queue_module.Empty:
+                break
+            handle_result(ep_num, ep_cost)
 
     start_wall = time.time()
     last_check_wall = start_wall
@@ -1023,22 +1112,31 @@ def train_a3c(config, tc, model_dir, student_config, force):
     for i in range(n_workers):
         p = mp.Process(target=a3c_worker, args=(
             i, shared_model, shared_optimizer, student_config,
-            flatten_observation, 50, total_episodes, global_counter, lock,
-            str(log_path), tc.get("gamma", 0.99), tc.get("ent_coef", 0.01),
+            flatten_observation, 50, total_episodes, assignment_counter,
+            completed_counter, lock, result_queue, str(log_path),
+            tc.get("gamma", 0.99), tc.get("ent_coef", 0.01),
             tc.get("max_grad_norm", 1.0), hidden))
         p.start()
         workers.append(p)
 
-    # Monitor the shared log while workers train.  Convergence is advisory
-    # only; workers are never stopped by this check.
+    # Monitor workers. Convergence remains advisory only.
     while any(p.is_alive() for p in workers):
         for p in workers:
-            p.join(timeout=0.25)
+            p.join(timeout=0.10)
+
+        # Consume episode results continuously so best-model snapshots are not
+        # limited to the five-minute checkpoint interval.
+        drain_results_nowait()
 
         now = time.time()
         if now - last_check_wall >= ckpt_sec:
             with lock:
-                current_ep = global_counter.value
+                current_ep = completed_counter.value
+
+            # Model-only recovery checkpoint. A3C remains asynchronous;
+            # SharedAdam state is reset if this checkpoint is resumed.
+            torch.save(snapshot_shared_model(), str(ckpt_path))
+
             _check_convergence_warning(
                 log_path=log_path,
                 label=name,
@@ -1046,26 +1144,90 @@ def train_a3c(config, tc, model_dir, student_config, force):
                 episode=current_ep,
                 state=convergence_state,
             )
+            meta = {
+                "steps_completed": current_ep * 50,
+                "episodes_completed": current_ep,
+                "wall_time_s": now - start_wall,
+                "best_rolling_cost": (
+                    best_cost if best_cost < float("inf") else None
+                ),
+                "last_checkpoint": datetime.now().isoformat(),
+            }
+            meta = _add_convergence_metadata(meta, convergence_state)
+            with open(model_dir / "training_metadata.json", "w") as f:
+                json.dump(meta, f, indent=2)
+            print(f"  [checkpoint] completed={current_ep:,}  "
+                  f"steps={current_ep * 50:,}  "
+                  f"best={best_cost:,.0f}")
             last_check_wall = now
 
     for p in workers:
         p.join()
 
-    # Save final model
-    torch.save(shared_model.state_dict(), str(model_dir / "final_model.pt"))
-    torch.save(shared_model.state_dict(), str(ckpt_path))
+    # Worker queue feeder threads may flush their final items just after exit.
+    with lock:
+        expected_results = completed_counter.value - ep_start
+
+    deadline = time.time() + 5.0
+    while processed_results < expected_results and time.time() < deadline:
+        try:
+            ep_num, ep_cost = result_queue.get(timeout=0.20)
+        except queue_module.Empty:
+            continue
+        handle_result(ep_num, ep_cost)
+
+    drain_results_nowait()
+
+    if processed_results != expected_results:
+        print(f"{name}: WARNING: processed {processed_results} episode-cost "
+              f"results but completed counter reports {expected_results}")
+
+    failed_workers = [
+        (i, p.exitcode)
+        for i, p in enumerate(workers)
+        if p.exitcode != 0
+    ]
+    if failed_workers:
+        torch.save(snapshot_shared_model(), str(ckpt_path))
+        with lock:
+            completed_ep = completed_counter.value
+        meta = {
+            "steps_completed": completed_ep * 50,
+            "episodes_completed": completed_ep,
+            "wall_time_s": time.time() - start_wall,
+            "best_rolling_cost": (
+                best_cost if best_cost < float("inf") else None
+            ),
+            "last_checkpoint": datetime.now().isoformat(),
+        }
+        meta = _add_convergence_metadata(meta, convergence_state)
+        with open(model_dir / "training_metadata.json", "w") as f:
+            json.dump(meta, f, indent=2)
+        raise RuntimeError(
+            f"{name}: worker process failure(s): {failed_workers}. "
+            f"Recovery model saved to {ckpt_path}")
+
+    # Save final model.
+    final_state = snapshot_shared_model()
+    torch.save(final_state, str(model_dir / "final_model.pt"))
+    torch.save(final_state, str(ckpt_path))
+
+    with lock:
+        completed_ep = completed_counter.value
 
     _check_convergence_warning(
         log_path=log_path,
         label=name,
-        step=total_episodes * 50,
-        episode=total_episodes,
+        step=completed_ep * 50,
+        episode=completed_ep,
         state=convergence_state,
     )
-    meta = {"steps_completed": total_episodes * 50,
-            "episodes_completed": total_episodes,
+    meta = {"steps_completed": completed_ep * 50,
+            "episodes_completed": completed_ep,
             "wall_time_s": time.time() - start_wall,
-            "best_rolling_cost": None,
+            "best_rolling_cost": (
+                best_cost if best_cost < float("inf") else None
+            ),
             "completed_at": datetime.now().isoformat()}
     meta = _add_convergence_metadata(meta, convergence_state)
     with open(model_dir / "training_metadata.json", "w") as f:
