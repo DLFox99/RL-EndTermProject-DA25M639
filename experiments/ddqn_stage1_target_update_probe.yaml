@@ -1,0 +1,20 @@
+name: ddqn-stage1-target-update-probe
+technique: ddqn
+force: true
+wandb_mode: disabled
+max_parallel: 1
+
+budget:
+  timesteps: 1000000
+
+base_overrides:
+  evaluation.periodic.default_interval_steps: 100000
+  target_update_interval: 1000
+
+grid:
+  tau:
+    - 0.005
+    - 0.05
+    - 1.0
+
+repeats: 1
