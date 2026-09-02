@@ -1,0 +1,22 @@
+name: nn-qlearning-stage1-exploration
+technique: nn_qlearning
+force: true
+wandb_mode: disabled
+max_parallel: 1
+
+budget:
+  episodes: 40000
+
+base_overrides:
+  learning_rate: 0.001
+  device: auto
+
+grid:
+  epsilon_end:
+    - 0.02
+    - 0.04
+  epsilon_decay_episodes:
+    - 14000
+    - 20000
+
+repeats: 1

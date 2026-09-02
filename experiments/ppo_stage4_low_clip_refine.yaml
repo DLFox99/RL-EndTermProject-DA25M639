@@ -1,0 +1,23 @@
+name: ppo-stage4-low-clip-refine
+technique: ppo
+force: true
+wandb_mode: disabled
+max_parallel: 2
+
+budget:
+  timesteps: 5000000
+
+base_overrides:
+  evaluation.periodic.default_interval_steps: 250000
+  learning_rate: 0.0008
+  ent_coef: 0.005
+
+grid:
+  gae_lambda:
+    - 0.90
+    - 0.93
+  clip_range:
+    - 0.06
+    - 0.08
+
+repeats: 1

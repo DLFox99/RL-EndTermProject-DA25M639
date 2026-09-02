@@ -1,0 +1,24 @@
+name: a2c-stage3-rollout-gae
+technique: a2c
+force: true
+wandb_mode: disabled
+max_parallel: 2
+
+budget:
+  timesteps: 5000000
+
+base_overrides:
+  evaluation.periodic.default_interval_steps: 250000
+  learning_rate: 0.0007
+  ent_coef: 0.0
+
+grid:
+  n_steps:
+    - 25
+    - 50
+    - 100
+  gae_lambda:
+    - 0.90
+    - 0.95
+
+repeats: 1
