@@ -1,0 +1,25 @@
+name: a3c-stage1-lr-entropy-long
+technique: a3c
+force: true
+wandb_mode: disabled
+max_parallel: 1
+
+budget:
+  episodes: 60000
+
+base_overrides:
+  n_workers: 4
+  gamma: 0.99
+  hidden: 128
+  max_grad_norm: 1.0
+
+grid:
+  learning_rate:
+    - 0.00005
+    - 0.00010
+    - 0.00020
+  ent_coef:
+    - 0.005
+    - 0.010
+
+repeats: 1
