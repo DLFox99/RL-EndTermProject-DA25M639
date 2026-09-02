@@ -1,0 +1,21 @@
+name: nn-sarsa-stage3-epsilon-floor-long
+technique: nn_sarsa
+force: true
+wandb_mode: disabled
+max_parallel: 1
+
+budget:
+  episodes: 60000
+
+base_overrides:
+  evaluation.periodic.default_interval_episodes: 3000
+  epsilon_decay_episodes: 20000
+
+grid:
+  epsilon_end:
+    - 0.02
+    - 0.03
+    - 0.04
+    - 0.05
+
+repeats: 1

@@ -1,0 +1,20 @@
+name: dqn-stage2-hard-target-interval-long
+technique: dqn
+force: true
+wandb_mode: disabled
+max_parallel: 1
+
+budget:
+  timesteps: 3000000
+
+base_overrides:
+  evaluation.periodic.default_interval_steps: 250000
+  tau: 1.0
+
+grid:
+  target_update_interval:
+    - 5000
+    - 10000
+    - 20000
+
+repeats: 1
