@@ -128,11 +128,31 @@ def a3c_worker(worker_id, shared_model, shared_optimizer, student_config,
         log_probs_t = torch.stack(log_probs_all)
         entropies_t = torch.stack(entropies_all)
 
-        advantages = returns - values_t.detach()
+        # Normalize returns once, up front, and use this normalized version
+        # everywhere downstream. Advantage normalization alone was not
+        # sufficient: with raw returns (order 1e5-1e6) feeding value_loss,
+        # and actor/critic sharing the same trunk, an exploding
+        # value_loss gradient corrupted the actor's shared features even
+        # once the actor's own loss term was well-scaled. Diagnostics
+        # confirmed this -- value_loss climbed into the 1e7 range at
+        # exactly the point entropy collapsed and cost reverted, despite
+        # advantages already being standardized separately.
+        #
+        # values_t (the critic's raw output) must be compared against a
+        # target on the SAME scale it is being trained to predict, so we
+        # normalize returns first and derive both the value_loss target
+        # and the advantage from that single normalized series. This
+        # keeps the critic's regression target and the actor's advantage
+        # signal internally consistent, rather than mixing a raw-scale
+        # critic prediction against a normalized target.
+        returns_norm = (returns - returns.mean()) / (returns.std(unbiased=False) + 1e-8)
+
+        advantages = returns_norm - values_t.detach()
+        advantages = (advantages - advantages.mean()) / (advantages.std(unbiased=False) + 1e-8)
 
         # Losses
         policy_loss = -(log_probs_t * advantages).mean()
-        value_loss = F.mse_loss(values_t, returns)
+        value_loss = F.mse_loss(values_t, returns_norm)
         entropy_loss = -entropies_t.mean()
 
         total_loss = policy_loss + 0.5 * value_loss + ent_coef * entropy_loss

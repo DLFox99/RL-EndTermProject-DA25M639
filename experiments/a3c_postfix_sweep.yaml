@@ -1,0 +1,17 @@
+name: a3c-postfix-sweep
+technique: a3c
+force: true
+wandb_mode: disabled
+max_parallel: 1
+budget:
+  episodes: 20000
+
+base_overrides:
+  n_workers: 5
+  gamma: 0.99
+  hidden: 128
+  max_grad_norm: 1.0
+
+grid:
+  learning_rate: [3.0e-5, 5.0e-5, 1.0e-4]
+  ent_coef: [0.005, 0.01]
