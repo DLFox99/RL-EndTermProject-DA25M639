@@ -6,6 +6,7 @@ Usage:
     python validate.py ppo dqn   # validate specific techniques
 """
 
+import argparse
 import subprocess
 import sys
 from pathlib import Path
@@ -21,14 +22,19 @@ def main():
     with open(CONFIG_PATH) as f:
         config = yaml.safe_load(f)
 
-    if len(sys.argv) > 1:
-        techniques = sys.argv[1:]
-    else:
-        techniques = list(config["techniques"].keys())
+    parser = argparse.ArgumentParser(description="Validate assembled submission policies")
+    parser.add_argument("techniques", nargs="*",
+                        help="Techniques to validate; default: all configured techniques")
+    parser.add_argument("--submissions-root", type=Path, default=SUBMISSIONS_DIR,
+                        help="Root containing assembled <technique>/ directories")
+    args = parser.parse_args()
+
+    techniques = args.techniques or list(config["techniques"].keys())
+    submissions_root = args.submissions_root.expanduser().resolve()
 
     results = {}
     for tech in techniques:
-        policy_file = SUBMISSIONS_DIR / tech / f"policy_{tech}.py"
+        policy_file = submissions_root / tech / f"policy_{tech}.py"
         if not policy_file.exists():
             print(f"  {tech}: policy file not found — run assemble first")
             results[tech] = "MISSING"
