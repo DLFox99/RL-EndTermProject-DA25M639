@@ -16,7 +16,26 @@ def parse_override(text: str) -> Tuple[str, Any]:
     if not key:
         raise ValueError("override key cannot be empty")
     value = yaml.safe_load(raw)
+    # yaml.safe_load can fail to recognize scientific notation like
+    # "3e-05" as a float (some PyYAML versions require a decimal point,
+    # e.g. "3.0e-05"), silently returning it as a string instead. Retry
+    # as float explicitly when yaml gives back a str that looks numeric.
+    if isinstance(value, str):
+        try:
+            value = float(value)
+        except ValueError:
+            pass
     return key, value
+
+#def parse_override(text: str) -> Tuple[str, Any]:
+#    if "=" not in text:
+#        raise ValueError(f"override must be KEY=VALUE, got: {text!r}")
+#    key, raw = text.split("=", 1)
+#    key = key.strip()
+#    if not key:
+#        raise ValueError("override key cannot be empty")
+#    value = yaml.safe_load(raw)
+#    return key, value
 
 
 def _set_dotted(root: Dict[str, Any], dotted: str, value: Any) -> None:
