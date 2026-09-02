@@ -1,0 +1,22 @@
+name: a2c-stage2-lr-entropy-long
+technique: a2c
+force: true
+wandb_mode: disabled
+max_parallel: 1
+
+budget:
+  timesteps: 5000000
+
+base_overrides:
+  evaluation.periodic.default_interval_steps: 250000
+
+grid:
+  learning_rate:
+    - 0.0005
+    - 0.0007
+    - 0.0010
+  ent_coef:
+    - 0.0
+    - 0.01
+
+repeats: 1

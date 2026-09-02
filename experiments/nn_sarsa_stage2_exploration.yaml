@@ -1,0 +1,21 @@
+name: nn-sarsa-stage2-exploration
+technique: nn_sarsa
+force: true
+wandb_mode: disabled
+max_parallel: 1
+
+budget:
+  episodes: 40000
+
+base_overrides:
+  evaluation.periodic.default_interval_episodes: 2000
+
+grid:
+  epsilon_end:
+    - 0.03
+    - 0.05
+  epsilon_decay_episodes:
+    - 20000
+    - 30000
+
+repeats: 1
