@@ -1,0 +1,157 @@
+name: Manual RL sweep
+
+on:
+  workflow_dispatch:
+    inputs:
+      experiment:
+        description: Experiment YAML under experiments/
+        required: true
+        type: string
+      shard_count:
+        description: Total deterministic shards
+        required: true
+        default: "1"
+        type: string
+      shard_index:
+        description: Zero-based shard handled by this runner
+        required: true
+        default: "0"
+        type: string
+      max_parallel:
+        description: Trials run concurrently on this 4-vCPU runner
+        required: true
+        default: "1"
+        type: choice
+        options:
+          - "1"
+          - "2"
+      dry_run:
+        description: Expand the shard without training
+        required: true
+        default: "false"
+        type: choice
+        options:
+          - "false"
+          - "true"
+
+permissions:
+  contents: read
+
+jobs:
+  sweep:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 350
+
+    env:
+      OMP_NUM_THREADS: "2"
+      MKL_NUM_THREADS: "2"
+      OPENBLAS_NUM_THREADS: "1"
+      NUMEXPR_NUM_THREADS: "1"
+      WANDB_MODE: disabled
+      PYTHONUNBUFFERED: "1"
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+
+      - name: Validate requested shard
+        shell: bash
+        env:
+          EXPERIMENT: ${{ inputs.experiment }}
+          SHARD_COUNT: ${{ inputs.shard_count }}
+          SHARD_INDEX: ${{ inputs.shard_index }}
+        run: |
+          set -euo pipefail
+
+          case "$EXPERIMENT" in
+            experiments/*.yaml) ;;
+            *)
+              echo "experiment must be an experiments/*.yaml path" >&2
+              exit 2
+              ;;
+          esac
+
+          test -f "$EXPERIMENT"
+          test "$SHARD_COUNT" -ge 1 2>/dev/null
+          test "$SHARD_INDEX" -ge 0 2>/dev/null
+          test "$SHARD_INDEX" -lt "$SHARD_COUNT" 2>/dev/null
+
+      - name: Run sweep shard
+        id: train
+        continue-on-error: true
+        shell: bash
+        env:
+          EXPERIMENT: ${{ inputs.experiment }}
+          SHARD_COUNT: ${{ inputs.shard_count }}
+          SHARD_INDEX: ${{ inputs.shard_index }}
+          MAX_PARALLEL: ${{ inputs.max_parallel }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          set -o pipefail
+          set +e
+
+          sweep_args=(
+            "$EXPERIMENT"
+            --shard-count "$SHARD_COUNT"
+            --shard-index "$SHARD_INDEX"
+            --max-parallel "$MAX_PARALLEL"
+          )
+          if test "$DRY_RUN" = "true"; then
+            sweep_args+=(--dry-run)
+          fi
+
+          timeout --signal=INT --kill-after=120s 330m \
+            python sweep_runner.py "${sweep_args[@]}" \
+            2>&1 | tee github_sweep.log
+
+          train_rc="${PIPESTATUS[0]}"
+          echo "TRAIN_RC=$train_rc" >> "$GITHUB_ENV"
+          exit "$train_rc"
+
+      - name: Encrypt sweep results
+        if: always() && hashFiles('sweeps/**') != ''
+        env:
+          RL_ARTIFACT_PASSWORD: ${{ secrets.RL_ARTIFACT_PASSWORD }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if test -z "${RL_ARTIFACT_PASSWORD:-}"; then
+            echo "Repository secret RL_ARTIFACT_PASSWORD is not configured." >&2
+            exit 2
+          fi
+
+          tar -czf rl-sweep-results.tar.gz sweeps github_sweep.log
+          openssl enc -aes-256-cbc -salt -pbkdf2 \
+            -in rl-sweep-results.tar.gz \
+            -out rl-sweep-results.tar.gz.enc \
+            -pass env:RL_ARTIFACT_PASSWORD
+          rm -f rl-sweep-results.tar.gz
+
+      - name: Upload encrypted results
+        if: always() && hashFiles('rl-sweep-results.tar.gz.enc') != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: rl-sweep-${{ github.run_id }}-${{ inputs.shard_index }}
+          path: rl-sweep-results.tar.gz.enc
+          if-no-files-found: error
+          retention-days: 2
+
+      - name: Report training failure
+        if: always() && env.TRAIN_RC != '0'
+        shell: bash
+        run: |
+          echo "Sweep command exited with status ${TRAIN_RC:-unknown}." >&2
+          exit 1
