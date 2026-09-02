@@ -1,0 +1,17 @@
+name: a2c-stage4-gae093
+technique: a2c
+force: true
+wandb_mode: disabled
+max_parallel: 1
+
+budget:
+  timesteps: 5000000
+
+base_overrides:
+  evaluation.periodic.default_interval_steps: 250000
+  learning_rate: 0.0007
+  ent_coef: 0.0
+  n_steps: 25
+  gae_lambda: 0.93
+
+repeats: 1
