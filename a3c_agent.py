@@ -1,7 +1,11 @@
 """A3C — Asynchronous Advantage Actor-Critic.
 
-Multiple workers train in parallel, each with its own environment.
-Gradients are pushed to a shared model asynchronously (Hogwild-style).
+Multiple workers collect rollouts in parallel, each with its own
+environment. Gradient computation and rollout collection happen fully in
+parallel across workers; the shared-model gradient assignment and
+optimizer.step() are serialized under a lock to prevent gradient
+corruption from concurrent writes to the shared parameters (see the
+critical section in a3c_worker for details).
 
 Policy is factored: 3 independent categorical heads (one per product).
 """
@@ -142,14 +146,26 @@ def a3c_worker(worker_id, shared_model, shared_optimizer, student_config,
         grad_norm = nn.utils.clip_grad_norm_(
             local_model.parameters(), max_grad_norm)
 
-        for local_p, shared_p in zip(local_model.parameters(),
-                                      shared_model.parameters()):
-            if local_p.grad is None:
-                shared_p._grad = None
-            else:
-                shared_p._grad = local_p.grad.detach().clone()
+        # CRITICAL SECTION: assigning this worker's gradient into the
+        # shared model's .grad tensors and calling optimizer.step() must
+        # happen atomically. Without the lock, another worker can
+        # overwrite shared_p._grad between the assignment loop and the
+        # step() call, causing the optimizer to apply a mismatched or
+        # partially-overwritten gradient — this was corrupting training
+        # (cost would dip early then diverge as corrupted updates
+        # accumulated). Serializing this section trades some of A3C's
+        # nominal parallelism for correctness; rollout collection (the
+        # expensive part) still happens fully in parallel across workers,
+        # only this brief update step is serialized.
+        with lock:
+            for local_p, shared_p in zip(local_model.parameters(),
+                                          shared_model.parameters()):
+                if local_p.grad is None:
+                    shared_p._grad = None
+                else:
+                    shared_p._grad = local_p.grad.detach().clone()
 
-        shared_optimizer.step()
+            shared_optimizer.step()
 
         # Log episode cost
         ep_cost = sum(-r * 100 for r in rewards)
