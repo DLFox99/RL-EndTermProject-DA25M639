@@ -1,0 +1,23 @@
+name: ppo-stage2-lr-entropy-long
+technique: ppo
+force: true
+wandb_mode: disabled
+max_parallel: 2
+
+budget:
+  timesteps: 5000000
+
+base_overrides:
+  evaluation.periodic.default_interval_steps: 250000
+
+grid:
+  learning_rate:
+    - 0.0005
+    - 0.0006
+    - 0.0007
+    - 0.0008
+  ent_coef:
+    - 0.0
+    - 0.005
+
+repeats: 1
