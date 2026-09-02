@@ -6,6 +6,7 @@ Usage:
     python assemble.py ppo dqn    # assemble specific techniques
 """
 
+import argparse
 import shutil
 import subprocess
 import sys
@@ -240,17 +241,22 @@ def run_policy(observation):
 '''
 
 
-def assemble_technique(tech_name, tc):
-    """Generate policy.py, copy model, create upload zip."""
-    model_dir = MODELS_DIR / tech_name
-    sub_dir = SUBMISSIONS_DIR / tech_name
+def assemble_technique(tech_name, tc, models_root=MODELS_DIR,
+                       submissions_root=SUBMISSIONS_DIR, checkpoint="auto"):
+    """Generate policy.py, copy model, create upload zip.
+
+    ``checkpoint='auto'`` prefers deterministic-evaluation selection, then
+    the training-rolling best, then the final checkpoint.
+    """
+    model_dir = Path(models_root) / tech_name
+    sub_dir = Path(submissions_root) / tech_name
     sub_dir.mkdir(parents=True, exist_ok=True)
 
     category = tc.get("category", "onpolicy")
     action_type = tc.get("action_type", "multi")
     portal_name = tc.get("portal_name", tech_name)
 
-    # --- Determine model source (prefer best_model) ---
+    # --- Determine model source ---
     ext_map = {
         "onpolicy": ".zip", "offpolicy": ".zip",
         "reinforce": ".pt", "a3c": ".pt",
@@ -258,15 +264,23 @@ def assemble_technique(tech_name, tc):
     }
     ext = ext_map.get(category, ".zip")
 
-    best_path = model_dir / f"best_model{ext}"
-    final_path = model_dir / f"final_model{ext}"
+    checkpoint_names = {
+        "best_eval": [f"best_eval_model{ext}"],
+        "best_train": [f"best_model{ext}"],
+        "final": [f"final_model{ext}"],
+        "auto": [f"best_eval_model{ext}", f"best_model{ext}", f"final_model{ext}"],
+    }
+    if checkpoint not in checkpoint_names:
+        raise ValueError(f"unknown checkpoint selector: {checkpoint}")
 
-    if best_path.exists():
-        src_model = best_path
-    elif final_path.exists():
-        src_model = final_path
-    else:
-        print(f"  {tech_name}: no model found, skipping")
+    src_model = None
+    for name in checkpoint_names[checkpoint]:
+        candidate = model_dir / name
+        if candidate.exists():
+            src_model = candidate
+            break
+    if src_model is None:
+        print(f"  {tech_name}: no {checkpoint} checkpoint found in {model_dir}, skipping")
         return False
 
     model_artifact = f"{tech_name}_model{ext}"
@@ -351,21 +365,40 @@ def main():
     with open(CONFIG_PATH) as f:
         config = yaml.safe_load(f)
 
-    if len(sys.argv) > 1:
-        techniques = sys.argv[1:]
-    else:
-        techniques = list(config["techniques"].keys())
+    parser = argparse.ArgumentParser(description="Assemble portal submission packages")
+    parser.add_argument("techniques", nargs="*",
+                        help="Techniques to assemble; default: all configured techniques")
+    parser.add_argument("--models-root", type=Path, default=MODELS_DIR,
+                        help="Root containing <technique>/ checkpoint directories")
+    parser.add_argument("--submissions-root", type=Path, default=SUBMISSIONS_DIR,
+                        help="Output root for assembled submission directories")
+    parser.add_argument(
+        "--checkpoint",
+        choices=["auto", "best_eval", "best_train", "final"],
+        default="auto",
+        help="Checkpoint selection; auto prefers best_eval, then best_train, then final",
+    )
+    args = parser.parse_args()
+
+    techniques = args.techniques or list(config["techniques"].keys())
+    models_root = args.models_root.expanduser().resolve()
+    submissions_root = args.submissions_root.expanduser().resolve()
 
     print("Assembling submission packages...")
     count = 0
     for tech in techniques:
         if tech in config["techniques"]:
-            if assemble_technique(tech, config["techniques"][tech]):
+            if assemble_technique(
+                tech, config["techniques"][tech],
+                models_root=models_root,
+                submissions_root=submissions_root,
+                checkpoint=args.checkpoint,
+            ):
                 count += 1
         else:
             print(f"  {tech}: not in config, skipping")
 
-    print(f"\n{count} packages assembled in submissions/")
+    print(f"\n{count} packages assembled in {submissions_root}/")
     print("Upload the *_upload.zip files to the portal.")
 
 
